@@ -5,3 +5,5 @@ __pycache__/
 build/
 dist/
 *.spec
+tema_preferido.txt
+servidor.txt
