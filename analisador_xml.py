@@ -17,6 +17,7 @@ Campos extraidos:
     - vNF     -> Valor Total da Nota Fiscal
     - CFOP    -> CFOP(s) dos itens da nota (um ou mais, separados por " / ")
     - dest/xNome -> Nome do Comprador/Destinatario
+    - dest/CNPJ ou dest/CPF -> CNPJ/CPF do Comprador/Destinatario
     - infCpl  -> Informacoes Complementares (observacoes da nota)
 
 INSTALACAO (se for rodar o .py direto, sem o executavel)
@@ -87,7 +88,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.0"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.1"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -211,6 +212,19 @@ def extrair_cfops(inf_nfe):
     return " / ".join(cfops_encontrados)
 
 
+def extrair_cnpj_cpf_destinatario(inf_nfe):
+    """
+    O destinatario (comprador) pode ser identificado por CNPJ (pessoa
+    juridica) ou CPF (pessoa fisica) -- a NF-e so preenche um dos dois
+    campos, nunca os dois. Essa funcao tenta o CNPJ primeiro e, se nao
+    encontrar, cai para o CPF.
+    """
+    cnpj = extrair_texto(inf_nfe, "nfe:dest/nfe:CNPJ")
+    if cnpj:
+        return cnpj
+    return extrair_texto(inf_nfe, "nfe:dest/nfe:CPF")
+
+
 def processar_arquivo_xml(caminho_arquivo, callback_log=print):
     """
     Le um unico arquivo XML de NF-e e devolve um dicionario com os
@@ -241,6 +255,7 @@ def processar_arquivo_xml(caminho_arquivo, callback_log=print):
         "CNPJ Emitente": extrair_texto(inf_nfe, "nfe:emit/nfe:CNPJ"),
         "Nome Emitente (xNome)": extrair_texto(inf_nfe, "nfe:emit/nfe:xNome"),
         "Nome do Comprador (dest/xNome)": extrair_texto(inf_nfe, "nfe:dest/nfe:xNome"),
+        "CNPJ/CPF do Comprador": extrair_cnpj_cpf_destinatario(inf_nfe),
         "Valor Total da Nota (vNF)": extrair_texto(inf_nfe, "nfe:total/nfe:ICMSTot/nfe:vNF"),
         "CFOP": extrair_cfops(inf_nfe),
         # infCpl fica dentro de <infAdic>, por isso o caminho tem os dois niveis:
@@ -305,7 +320,7 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
     # tipo sozinho, ele trata esses campos como numero e "come" os
     # zeros a esquerda. Por isso forcamos essas colunas a
     # permanecerem como texto.
-    colunas_texto = ["Chave de Acesso (chNFe)", "CNPJ Emitente", "Numero da Nota (nNF)", "CFOP"]
+    colunas_texto = ["Chave de Acesso (chNFe)", "CNPJ Emitente", "Numero da Nota (nNF)", "CFOP", "CNPJ/CPF do Comprador"]
     for coluna in colunas_texto:
         if coluna in df.columns:
             df[coluna] = df[coluna].astype(str)
@@ -531,7 +546,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(card, text="Extrai Chave de Acesso, Numero, Data de Emissao, CNPJ/Nome do Emitente, "
-                                 "Nome do Comprador, Valor Total, CFOP e Observacoes de cada nota.",
+                                 "Nome e CNPJ/CPF do Comprador, Valor Total, CFOP e Observacoes de cada nota.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
