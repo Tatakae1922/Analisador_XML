@@ -5,8 +5,10 @@
  HEC ASSESSORIA CONTABIL S/S LTDA.
 ====================================================================
 Le todos os arquivos XML de NF-e (Nota Fiscal Eletronica) dentro de
-uma pasta (varre subpastas tambem) e extrai os campos principais
-para uma planilha Excel (.xlsx) ou CSV.
+uma pasta (varre subpastas tambem, inclusive XMLs dentro de arquivos
+.zip, sem precisar extrair manualmente) e extrai os campos principais
+para uma planilha Excel (.xlsx) ou CSV, ja formatada com as cores da
+HEC.
 
 Campos extraidos:
     - chNFe   -> Chave de Acesso (44 digitos)
@@ -19,6 +21,10 @@ Campos extraidos:
     - dest/xNome -> Nome do Comprador/Destinatario
     - dest/CNPJ ou dest/CPF -> CNPJ/CPF do Comprador/Destinatario
     - infCpl  -> Informacoes Complementares (observacoes da nota)
+    - cobr/fat/nFat -> Numero da Fatura/Duplicata (quando a nota tem)
+    - cobr/dup      -> Parcelas (numero, vencimento e valor) -- vao para
+                       uma aba separada "Fatura e Duplicatas", uma linha
+                       por parcela, só das notas que tem esse campo
 
 INSTALACAO (se for rodar o .py direto, sem o executavel)
 ----------------------------------------------------------
@@ -30,8 +36,11 @@ import os
 import sys
 import threading
 import xml.etree.ElementTree as ET
+import zipfile
 
 import pandas as pd
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -88,7 +97,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.1"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.2"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -225,31 +234,85 @@ def extrair_cnpj_cpf_destinatario(inf_nfe):
     return extrair_texto(inf_nfe, "nfe:dest/nfe:CPF")
 
 
-def processar_arquivo_xml(caminho_arquivo, callback_log=print):
+def extrair_fatura_e_duplicatas(inf_nfe):
     """
-    Le um unico arquivo XML de NF-e e devolve um dicionario com os
-    campos que nos interessam. Se o arquivo nao for uma NF-e valida
-    (por exemplo, um XML corrompido ou de outro tipo), devolve None
-    e avisa via 'callback_log', para o processamento nao parar no
-    meio do lote.
+    O bloco <cobr> (cobranca) e OPCIONAL na NF-e -- só aparece quando a
+    venda foi feita a prazo/faturada. Quando existe, traz:
+
+        <fat>  -> os dados da FATURA/DUPLICATA como um todo (numero)
+        <dup>  -> uma ou mais parcelas, cada uma com numero (nDup),
+                  data de vencimento (dVenc) e valor (vDup)
+
+    Devolve uma tupla (numero_fatura, lista_parcelas):
+        numero_fatura  -> string (nFat), ou "" se a nota nao tem cobr/fat
+        lista_parcelas -> lista de dicts {"nDup", "dVenc", "vDup"},
+                           vazia se a nota nao tem nenhuma parcela
     """
-    try:
-        arvore = ET.parse(caminho_arquivo)
-        root = arvore.getroot()
-    except ET.ParseError as erro:
-        callback_log(f"[AVISO] Nao foi possivel ler o XML '{os.path.basename(caminho_arquivo)}': {erro}")
-        return None
+    numero_fatura = extrair_texto(inf_nfe, "nfe:cobr/nfe:fat/nfe:nFat")
+
+    lista_parcelas = []
+    for dup_elemento in inf_nfe.findall("nfe:cobr/nfe:dup", NS):
+        lista_parcelas.append({
+            "nDup": extrair_texto(dup_elemento, "nfe:nDup"),
+            "dVenc": extrair_texto(dup_elemento, "nfe:dVenc"),
+            "vDup": extrair_texto(dup_elemento, "nfe:vDup"),
+        })
+
+    return numero_fatura, lista_parcelas
+
+
+def processar_arquivo_xml(fonte, callback_log=print):
+    """
+    Le um unico XML de NF-e e devolve uma tupla (dados, linhas_parcelas):
+
+        dados            -> dicionario com os campos principais da nota
+        linhas_parcelas  -> lista de dicts, uma por parcela da
+                             fatura/duplicata (cobr/dup) -- vazia se a
+                             nota nao tiver esse bloco
+
+    'fonte' aceita dois formatos (ver listar_fontes_xml):
+        - uma string: caminho de um arquivo .xml solto no disco
+        - uma tupla ("zip", caminho_do_zip, nome_interno): um .xml que
+          esta DENTRO de um arquivo .zip, sem precisar extrair primeiro
+
+    Se o arquivo nao for uma NF-e valida (por exemplo, um XML corrompido
+    ou de outro tipo), devolve (None, []) e avisa via 'callback_log',
+    para o processamento nao parar no meio do lote.
+    """
+    if isinstance(fonte, tuple):
+        _tipo, caminho_zip, nome_interno = fonte
+        nome_exibicao = f"{nome_interno} (dentro de {os.path.basename(caminho_zip)})"
+        try:
+            with zipfile.ZipFile(caminho_zip) as arquivo_zip:
+                conteudo = arquivo_zip.read(nome_interno)
+            root = ET.fromstring(conteudo)
+        except (ET.ParseError, zipfile.BadZipFile, KeyError) as erro:
+            callback_log(f"[AVISO] Nao foi possivel ler o XML '{nome_exibicao}': {erro}")
+            return None, []
+        nome_arquivo = nome_exibicao
+    else:
+        try:
+            arvore = ET.parse(fonte)
+            root = arvore.getroot()
+        except ET.ParseError as erro:
+            callback_log(f"[AVISO] Nao foi possivel ler o XML '{os.path.basename(fonte)}': {erro}")
+            return None, []
+        nome_arquivo = os.path.basename(fonte)
 
     inf_nfe = root.find(".//nfe:infNFe", NS)
     if inf_nfe is None:
-        callback_log(f"[AVISO] Arquivo '{os.path.basename(caminho_arquivo)}' nao parece ser uma NF-e (tag infNFe nao encontrada).")
-        return None
+        callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser uma NF-e (tag infNFe nao encontrada).")
+        return None, []
 
     dhEmi = extrair_texto(inf_nfe, "nfe:ide/nfe:dhEmi")
+    chave_acesso = extrair_chave_acesso(root)
+    numero_nota = extrair_texto(inf_nfe, "nfe:ide/nfe:nNF")
+
+    numero_fatura, lista_parcelas = extrair_fatura_e_duplicatas(inf_nfe)
 
     dados = {
-        "Chave de Acesso (chNFe)": extrair_chave_acesso(root),
-        "Numero da Nota (nNF)": extrair_texto(inf_nfe, "nfe:ide/nfe:nNF"),
+        "Chave de Acesso (chNFe)": chave_acesso,
+        "Numero da Nota (nNF)": numero_nota,
         "Data de Emissao": extrair_data_emissao_formatada(dhEmi),
         "Data/Hora de Emissao (dhEmi)": dhEmi,
         "CNPJ Emitente": extrair_texto(inf_nfe, "nfe:emit/nfe:CNPJ"),
@@ -260,24 +323,85 @@ def processar_arquivo_xml(caminho_arquivo, callback_log=print):
         "CFOP": extrair_cfops(inf_nfe),
         # infCpl fica dentro de <infAdic>, por isso o caminho tem os dois niveis:
         "Informacoes Complementares (infCpl)": extrair_texto(inf_nfe, "nfe:infAdic/nfe:infCpl"),
-        "Arquivo de Origem": os.path.basename(caminho_arquivo),
+        "Numero da Fatura (nFat)": numero_fatura,
+        "Quantidade de Parcelas": len(lista_parcelas),
+        "Arquivo de Origem": nome_arquivo,
     }
-    return dados
+
+    linhas_parcelas = []
+    for indice, parcela in enumerate(lista_parcelas, start=1):
+        linhas_parcelas.append({
+            "Arquivo de Origem": nome_arquivo,
+            "Chave de Acesso (chNFe)": chave_acesso,
+            "Numero da Nota (nNF)": numero_nota,
+            "Numero da Fatura (nFat)": numero_fatura,
+            "Parcela": indice,
+            "Numero da Parcela (nDup)": parcela["nDup"],
+            "Vencimento": extrair_data_emissao_formatada(parcela["dVenc"]),
+            "Valor da Parcela (vDup)": parcela["vDup"],
+        })
+
+    return dados, linhas_parcelas
 
 
-def listar_arquivos_xml(pasta):
+def listar_fontes_xml(pasta):
     """
-    Varre a pasta informada (incluindo subpastas) e devolve a lista
-    de caminhos completos de todos os arquivos que terminam com
-    ".xml" (sem diferenciar maiusculas/minusculas).
+    Varre a pasta informada (incluindo subpastas) e devolve a lista de
+    "fontes" de XML encontradas -- tanto arquivos .xml soltos quanto
+    XMLs que estao DENTRO de arquivos .zip (sem precisar extrair
+    manualmente antes).
+
+    Cada item da lista e:
+        - uma string, para um .xml solto (o caminho completo dele)
+        - uma tupla ("zip", caminho_do_zip, nome_interno), para um .xml
+          que esta dentro de um .zip (nome_interno e o caminho dele
+          DENTRO do zip, ex.: "notas/3016.xml")
     """
-    arquivos_encontrados = []
+    fontes_encontradas = []
     for pasta_atual, _subpastas, arquivos in os.walk(pasta):
         for nome_arquivo in arquivos:
+            caminho_completo = os.path.join(pasta_atual, nome_arquivo)
             if nome_arquivo.lower().endswith(".xml"):
-                caminho_completo = os.path.join(pasta_atual, nome_arquivo)
-                arquivos_encontrados.append(caminho_completo)
-    return arquivos_encontrados
+                fontes_encontradas.append(caminho_completo)
+            elif nome_arquivo.lower().endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(caminho_completo) as arquivo_zip:
+                        for nome_interno in arquivo_zip.namelist():
+                            if nome_interno.lower().endswith(".xml"):
+                                fontes_encontradas.append(("zip", caminho_completo, nome_interno))
+                except zipfile.BadZipFile:
+                    pass  # zip corrompido/invalido -- ignora, sem travar o resto do processamento
+    return fontes_encontradas
+
+
+# Verde da logo da HEC Assessoria Contabil -- mesma cor de marca usada
+# na interface do programa (ver VERDE_HEC mais abaixo), aplicada aqui
+# no cabecalho das planilhas geradas para manter a identidade visual.
+VERDE_HEC_EXCEL = "00926E"
+
+
+def formatar_planilha_hec(planilha, df):
+    """
+    Aplica a formatacao padrao HEC numa aba ja escrita pelo
+    pandas/openpyxl: cabecalho verde (cor da logo) com texto branco em
+    negrito, linha de cabecalho congelada (fica visivel ao rolar) e
+    largura de coluna ajustada ao conteudo.
+    """
+    preenchimento_cabecalho = PatternFill(start_color=VERDE_HEC_EXCEL, end_color=VERDE_HEC_EXCEL, fill_type="solid")
+    fonte_cabecalho = Font(color="000000", bold=True)
+    alinhamento_cabecalho = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for indice_coluna, nome_coluna in enumerate(df.columns, start=1):
+        celula = planilha.cell(row=1, column=indice_coluna)
+        celula.fill = preenchimento_cabecalho
+        celula.font = fonte_cabecalho
+        celula.alignment = alinhamento_cabecalho
+
+        maior_texto = max([len(str(nome_coluna))] + [len(str(valor)) for valor in df.iloc[:, indice_coluna - 1]])
+        planilha.column_dimensions[get_column_letter(indice_coluna)].width = min(max(maior_texto + 2, 12), 45)
+
+    planilha.freeze_panes = "A2"
+    planilha.row_dimensions[1].height = 28
 
 
 def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
@@ -292,21 +416,24 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
         mensagem -> texto explicando o resultado final
     """
     callback_log(f"Procurando arquivos XML em: {pasta_xmls}")
-    arquivos_xml = listar_arquivos_xml(pasta_xmls)
+    fontes_xml = listar_fontes_xml(pasta_xmls)
 
-    if not arquivos_xml:
-        mensagem = "Nenhum arquivo .xml foi encontrado na pasta de origem selecionada."
+    if not fontes_xml:
+        mensagem = "Nenhum arquivo .xml (solto ou dentro de .zip) foi encontrado na pasta de origem selecionada."
         callback_log(mensagem)
         return False, mensagem
 
-    callback_log(f"{len(arquivos_xml)} arquivo(s) XML encontrado(s). Processando...")
+    callback_log(f"{len(fontes_xml)} arquivo(s) XML encontrado(s). Processando...")
 
     linhas = []
-    for caminho in arquivos_xml:
-        callback_log(f"Lendo: {os.path.basename(caminho)}")
-        dados = processar_arquivo_xml(caminho, callback_log=callback_log)
+    linhas_parcelas = []
+    for fonte in fontes_xml:
+        nome_para_log = f"{fonte[2]} (dentro de {os.path.basename(fonte[1])})" if isinstance(fonte, tuple) else os.path.basename(fonte)
+        callback_log(f"Lendo: {nome_para_log}")
+        dados, parcelas_da_nota = processar_arquivo_xml(fonte, callback_log=callback_log)
         if dados is not None:
             linhas.append(dados)
+            linhas_parcelas.extend(parcelas_da_nota)
 
     if not linhas:
         mensagem = "Nenhuma nota fiscal valida foi extraida dos XMLs encontrados. Nada foi salvo."
@@ -320,7 +447,8 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
     # tipo sozinho, ele trata esses campos como numero e "come" os
     # zeros a esquerda. Por isso forcamos essas colunas a
     # permanecerem como texto.
-    colunas_texto = ["Chave de Acesso (chNFe)", "CNPJ Emitente", "Numero da Nota (nNF)", "CFOP", "CNPJ/CPF do Comprador"]
+    colunas_texto = ["Chave de Acesso (chNFe)", "CNPJ Emitente", "Numero da Nota (nNF)", "CFOP",
+                      "CNPJ/CPF do Comprador", "Numero da Fatura (nFat)"]
     for coluna in colunas_texto:
         if coluna in df.columns:
             df[coluna] = df[coluna].astype(str)
@@ -332,10 +460,31 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
             df["Valor Total da Nota (vNF)"], errors="coerce"
         )
 
+    # Aba separada "Fatura e Duplicatas" -- so existe se pelo menos uma
+    # nota do lote tiver o bloco cobr/dup (venda a prazo/faturada). Uma
+    # linha por PARCELA (nao por nota), para facilitar conferencia de
+    # vencimentos/valores no Excel (filtro, soma, etc.).
+    df_parcelas = None
+    if linhas_parcelas:
+        df_parcelas = pd.DataFrame(linhas_parcelas)
+        colunas_texto_parcelas = ["Chave de Acesso (chNFe)", "Numero da Nota (nNF)",
+                                   "Numero da Fatura (nFat)", "Numero da Parcela (nDup)"]
+        for coluna in colunas_texto_parcelas:
+            if coluna in df_parcelas.columns:
+                df_parcelas[coluna] = df_parcelas[coluna].astype(str)
+        df_parcelas["Valor da Parcela (vDup)"] = pd.to_numeric(
+            df_parcelas["Valor da Parcela (vDup)"], errors="coerce"
+        )
+
     extensao = os.path.splitext(arquivo_saida)[1].lower()
 
     if extensao == ".csv":
+        # CSV so suporta uma tabela por arquivo -- a aba de parcelas,
+        # quando existir, vai para um segundo arquivo .csv ao lado.
         df.to_csv(arquivo_saida, index=False, sep=";", encoding="utf-8-sig")
+        if df_parcelas is not None:
+            caminho_parcelas = os.path.splitext(arquivo_saida)[0] + "_fatura_duplicatas.csv"
+            df_parcelas.to_csv(caminho_parcelas, index=False, sep=";", encoding="utf-8-sig")
     else:
         if extensao != ".xlsx":
             arquivo_saida = os.path.splitext(arquivo_saida)[0] + ".xlsx"
@@ -354,10 +503,25 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
                 for linha_num in range(2, len(df) + 2):
                     celula = planilha[f"{letra_coluna}{linha_num}"]
                     celula.number_format = "@"
+            formatar_planilha_hec(planilha, df)
+
+            if df_parcelas is not None:
+                df_parcelas.to_excel(writer, index=False, sheet_name="Fatura e Duplicatas")
+                planilha_parcelas = writer.sheets["Fatura e Duplicatas"]
+                for coluna in colunas_texto_parcelas:
+                    if coluna not in df_parcelas.columns:
+                        continue
+                    indice_coluna = df_parcelas.columns.get_loc(coluna) + 1
+                    letra_coluna = planilha_parcelas.cell(row=1, column=indice_coluna).column_letter
+                    for linha_num in range(2, len(df_parcelas) + 2):
+                        celula = planilha_parcelas[f"{letra_coluna}{linha_num}"]
+                        celula.number_format = "@"
+                formatar_planilha_hec(planilha_parcelas, df_parcelas)
 
     mensagem = (
-        f"Concluido! {len(linhas)} nota(s) fiscal(is) exportada(s) com sucesso.\n"
-        f"Arquivo salvo em: {os.path.abspath(arquivo_saida)}"
+        f"Concluido! {len(linhas)} nota(s) fiscal(is) exportada(s) com sucesso"
+        + (f", sendo {len(linhas_parcelas)} parcela(s) de fatura/duplicata em {sum(1 for l in linhas if l['Quantidade de Parcelas'] > 0)} nota(s)." if linhas_parcelas else ".")
+        + f"\nArquivo salvo em: {os.path.abspath(arquivo_saida)}"
     )
     callback_log(mensagem)
     return True, mensagem
@@ -491,7 +655,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(card, text="1.  Pasta de origem (onde estao os arquivos XML)",
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
-        ctk.CTkLabel(card, text="Pode conter subpastas -- o programa varre tudo recursivamente.",
+        ctk.CTkLabel(card, text="Pode conter subpastas -- o programa varre tudo recursivamente, inclusive "
+                                 "XMLs que estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
@@ -546,7 +711,9 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(card, text="Extrai Chave de Acesso, Numero, Data de Emissao, CNPJ/Nome do Emitente, "
-                                 "Nome e CNPJ/CPF do Comprador, Valor Total, CFOP e Observacoes de cada nota.",
+                                 "Nome e CNPJ/CPF do Comprador, Valor Total, CFOP, Observacoes e Fatura/Duplicatas "
+                                 "(quantidade de parcelas, vencimento e valor) de cada nota -- inclusive as que "
+                                 "estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
