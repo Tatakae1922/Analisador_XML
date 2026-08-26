@@ -33,6 +33,7 @@ INSTALACAO (se for rodar o .py direto, sem o executavel)
 """
 
 import os
+import re
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -97,7 +98,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.2"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.3"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -261,14 +262,113 @@ def extrair_fatura_e_duplicatas(inf_nfe):
     return numero_fatura, lista_parcelas
 
 
+def _texto_valor_br_para_float(texto_valor):
+    """Converte um valor no formato BR ("25.000,00") para float. Devolve
+    None se o texto nao for um numero valido."""
+    texto_limpo = texto_valor.replace(".", "").replace(",", ".")
+    try:
+        return float(texto_limpo)
+    except ValueError:
+        return None
+
+
+# Formato de valor monetario BR dentro de texto livre: grupos de 3
+# digitos separados por ponto (milhar, opcional) + virgula + 2 casas
+# decimais -- ex.: "25.000,00" ou "199,90". Usar so "[\d.,]+" (sem essa
+# exigencia de 2 casas decimais no final) pega de brinde a pontuacao
+# da FRASE (ex.: a virgula de "R$25.000,00, pago via..."), quebrando a
+# conversao para numero.
+PADRAO_VALOR_BR = r"(\d{1,3}(?:\.\d{3})*,\d{2})"
+
+
+def extrair_condicoes_pagamento_do_texto(texto_infcpl, valor_total_nota=None):
+    """
+    A NF-e NAO tem um campo estruturado para "sinal/entrada",
+    "orcamento", "a vista" ou "condicao de pagamento por extenso" --
+    quando o emissor descreve isso, e sempre como TEXTO LIVRE dentro
+    de infCpl (Informacoes Complementares / Dados Adicionais). Por
+    ser texto livre, cada empresa/ERP escreve de um jeito diferente --
+    esta funcao e uma extracao HEURISTICA (por padroes de texto,
+    regex) que funciona para redacoes parecidas com o exemplo:
+
+        "VENDA EFETUADA CONFORME ORCAMENTO 573/2025G. FORMA DE
+        PAGAMENTO: SINAL NO VALOR DE R$25.000,00, PAGO VIA
+        PIX/TRANSF E SALDO NO VALOR DE R$10.225,56 EM 02 BOLETOS
+        BANCARIOS COM VENCIMENTO 30/60 DIAS APOS DATA DE EMISSAO..."
+
+    ou, para venda a vista:
+
+        "PAGAMENTO A VISTA" / "VENDA A VISTA NO VALOR DE R$1.500,00"
+
+    Quando o texto tiver uma redacao muito diferente, os campos que
+    nao forem reconhecidos ficam de fora do dicionario devolvido (nao
+    "adivinha" nem inventa valor) -- EXCECAO: quando a palavra "A
+    VISTA" aparece mas nenhum valor e informado junto, assume-se o
+    Valor Total da Nota (vNF) como o valor a vista, ja que e o unico
+    valor que faz sentido nesse caso. Por isso o texto original tambem
+    e mantido na planilha, para conferencia manual de qualquer nota.
+
+    'valor_total_nota' -> float com o vNF da nota (ou None), usado
+    apenas como fallback do "Valor a Vista" quando o texto nao traz
+    um valor explicito.
+
+    Devolve um dicionario (vazio se nada foi reconhecido) com as
+    chaves que forem encontradas dentre:
+        "Numero do Orcamento", "Valor do Sinal/Entrada",
+        "Valor Residual/Saldo", "Quantidade de Parcelas (texto)",
+        "Vencimento/Prazo (texto)", "Valor a Vista"
+    """
+    if not texto_infcpl:
+        return {}
+
+    texto = texto_infcpl.upper()
+    resultado = {}
+
+    combinacao = re.search(r"OR[CÇ]AMENTO\s*N?[ºO°:]*\s*([A-Z0-9./-]+)", texto)
+    if combinacao:
+        resultado["Numero do Orcamento"] = combinacao.group(1).rstrip(".,")
+
+    combinacao = re.search(r"SINAL(?:\s+NO\s+VALOR\s+DE)?\s*R\$\s*" + PADRAO_VALOR_BR, texto)
+    if combinacao:
+        resultado["Valor do Sinal/Entrada"] = _texto_valor_br_para_float(combinacao.group(1))
+
+    combinacao = re.search(r"(?:SALDO|VALOR\s+RESIDUAL)(?:\s+NO\s+VALOR\s+DE)?\s*R\$\s*" + PADRAO_VALOR_BR, texto)
+    if combinacao:
+        resultado["Valor Residual/Saldo"] = _texto_valor_br_para_float(combinacao.group(1))
+
+    combinacao = re.search(r"(\d+)\s*BOLET", texto) or re.search(r"EM\s+(\d+)\s*(?:PARCELAS|VEZES)", texto)
+    if combinacao:
+        resultado["Quantidade de Parcelas (texto)"] = int(combinacao.group(1))
+
+    combinacao = re.search(r"VENCIMENTO\S*\s+(.+?)(?:\.|$)", texto)
+    if combinacao:
+        resultado["Vencimento/Prazo (texto)"] = combinacao.group(1).strip().rstrip(".")
+
+    # "A VISTA" ("A" ou "À") -- procura um valor logo depois da
+    # expressao (ex.: "A VISTA NO VALOR DE R$1.500,00"); se a palavra
+    # aparecer mas sem valor nenhum junto, cai no valor total da nota.
+    if re.search(r"[AÀ]\s*VISTA", texto):
+        combinacao = re.search(r"[AÀ]\s*VISTA(?:\s+NO\s+VALOR\s+DE)?\s*R\$\s*" + PADRAO_VALOR_BR, texto)
+        if combinacao:
+            resultado["Valor a Vista"] = _texto_valor_br_para_float(combinacao.group(1))
+        else:
+            resultado["Valor a Vista"] = valor_total_nota
+
+    return resultado
+
+
 def processar_arquivo_xml(fonte, callback_log=print):
     """
-    Le um unico XML de NF-e e devolve uma tupla (dados, linhas_parcelas):
+    Le um unico XML de NF-e e devolve uma tupla
+    (dados, linhas_parcelas, linha_condicao_pagamento):
 
-        dados            -> dicionario com os campos principais da nota
-        linhas_parcelas  -> lista de dicts, uma por parcela da
-                             fatura/duplicata (cobr/dup) -- vazia se a
-                             nota nao tiver esse bloco
+        dados                     -> dicionario com os campos principais da nota
+        linhas_parcelas           -> lista de dicts, uma por parcela da
+                                      fatura/duplicata (cobr/dup) -- vazia se a
+                                      nota nao tiver esse bloco
+        linha_condicao_pagamento  -> dict com o que foi reconhecido no texto de
+                                      infCpl (ver extrair_condicoes_pagamento_do_texto),
+                                      ou None se nada foi reconhecido
 
     'fonte' aceita dois formatos (ver listar_fontes_xml):
         - uma string: caminho de um arquivo .xml solto no disco
@@ -276,8 +376,8 @@ def processar_arquivo_xml(fonte, callback_log=print):
           esta DENTRO de um arquivo .zip, sem precisar extrair primeiro
 
     Se o arquivo nao for uma NF-e valida (por exemplo, um XML corrompido
-    ou de outro tipo), devolve (None, []) e avisa via 'callback_log',
-    para o processamento nao parar no meio do lote.
+    ou de outro tipo), devolve (None, [], None) e avisa via
+    'callback_log', para o processamento nao parar no meio do lote.
     """
     if isinstance(fonte, tuple):
         _tipo, caminho_zip, nome_interno = fonte
@@ -288,7 +388,7 @@ def processar_arquivo_xml(fonte, callback_log=print):
             root = ET.fromstring(conteudo)
         except (ET.ParseError, zipfile.BadZipFile, KeyError) as erro:
             callback_log(f"[AVISO] Nao foi possivel ler o XML '{nome_exibicao}': {erro}")
-            return None, []
+            return None, [], None
         nome_arquivo = nome_exibicao
     else:
         try:
@@ -296,17 +396,23 @@ def processar_arquivo_xml(fonte, callback_log=print):
             root = arvore.getroot()
         except ET.ParseError as erro:
             callback_log(f"[AVISO] Nao foi possivel ler o XML '{os.path.basename(fonte)}': {erro}")
-            return None, []
+            return None, [], None
         nome_arquivo = os.path.basename(fonte)
 
     inf_nfe = root.find(".//nfe:infNFe", NS)
     if inf_nfe is None:
         callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser uma NF-e (tag infNFe nao encontrada).")
-        return None, []
+        return None, [], None
 
     dhEmi = extrair_texto(inf_nfe, "nfe:ide/nfe:dhEmi")
     chave_acesso = extrair_chave_acesso(root)
     numero_nota = extrair_texto(inf_nfe, "nfe:ide/nfe:nNF")
+    texto_infcpl = extrair_texto(inf_nfe, "nfe:infAdic/nfe:infCpl")
+    texto_valor_total_nota = extrair_texto(inf_nfe, "nfe:total/nfe:ICMSTot/nfe:vNF")
+    try:
+        valor_total_nota = float(texto_valor_total_nota) if texto_valor_total_nota else None
+    except ValueError:
+        valor_total_nota = None
 
     numero_fatura, lista_parcelas = extrair_fatura_e_duplicatas(inf_nfe)
 
@@ -319,10 +425,10 @@ def processar_arquivo_xml(fonte, callback_log=print):
         "Nome Emitente (xNome)": extrair_texto(inf_nfe, "nfe:emit/nfe:xNome"),
         "Nome do Comprador (dest/xNome)": extrair_texto(inf_nfe, "nfe:dest/nfe:xNome"),
         "CNPJ/CPF do Comprador": extrair_cnpj_cpf_destinatario(inf_nfe),
-        "Valor Total da Nota (vNF)": extrair_texto(inf_nfe, "nfe:total/nfe:ICMSTot/nfe:vNF"),
+        "Valor Total da Nota (vNF)": texto_valor_total_nota,
         "CFOP": extrair_cfops(inf_nfe),
         # infCpl fica dentro de <infAdic>, por isso o caminho tem os dois niveis:
-        "Informacoes Complementares (infCpl)": extrair_texto(inf_nfe, "nfe:infAdic/nfe:infCpl"),
+        "Informacoes Complementares (infCpl)": texto_infcpl,
         "Numero da Fatura (nFat)": numero_fatura,
         "Quantidade de Parcelas": len(lista_parcelas),
         "Arquivo de Origem": nome_arquivo,
@@ -341,7 +447,23 @@ def processar_arquivo_xml(fonte, callback_log=print):
             "Valor da Parcela (vDup)": parcela["vDup"],
         })
 
-    return dados, linhas_parcelas
+    condicoes_encontradas = extrair_condicoes_pagamento_do_texto(texto_infcpl, valor_total_nota)
+    linha_condicao_pagamento = None
+    if condicoes_encontradas:
+        linha_condicao_pagamento = {
+            "Arquivo de Origem": nome_arquivo,
+            "Chave de Acesso (chNFe)": chave_acesso,
+            "Numero da Nota (nNF)": numero_nota,
+            "Numero do Orcamento": condicoes_encontradas.get("Numero do Orcamento", ""),
+            "Valor do Sinal/Entrada": condicoes_encontradas.get("Valor do Sinal/Entrada"),
+            "Valor Residual/Saldo": condicoes_encontradas.get("Valor Residual/Saldo"),
+            "Valor a Vista": condicoes_encontradas.get("Valor a Vista"),
+            "Quantidade de Parcelas (texto)": condicoes_encontradas.get("Quantidade de Parcelas (texto)"),
+            "Vencimento/Prazo (texto)": condicoes_encontradas.get("Vencimento/Prazo (texto)", ""),
+            "Texto Original (infCpl)": texto_infcpl,
+        }
+
+    return dados, linhas_parcelas, linha_condicao_pagamento
 
 
 def listar_fontes_xml(pasta):
@@ -427,13 +549,16 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
 
     linhas = []
     linhas_parcelas = []
+    linhas_condicoes_pagamento = []
     for fonte in fontes_xml:
         nome_para_log = f"{fonte[2]} (dentro de {os.path.basename(fonte[1])})" if isinstance(fonte, tuple) else os.path.basename(fonte)
         callback_log(f"Lendo: {nome_para_log}")
-        dados, parcelas_da_nota = processar_arquivo_xml(fonte, callback_log=callback_log)
+        dados, parcelas_da_nota, condicao_pagamento = processar_arquivo_xml(fonte, callback_log=callback_log)
         if dados is not None:
             linhas.append(dados)
             linhas_parcelas.extend(parcelas_da_nota)
+            if condicao_pagamento is not None:
+                linhas_condicoes_pagamento.append(condicao_pagamento)
 
     if not linhas:
         mensagem = "Nenhuma nota fiscal valida foi extraida dos XMLs encontrados. Nada foi salvo."
@@ -476,15 +601,31 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
             df_parcelas["Valor da Parcela (vDup)"], errors="coerce"
         )
 
+    # Aba separada "Condicoes de Pagamento (Texto)" -- extracao
+    # HEURISTICA do texto livre de infCpl (ver
+    # extrair_condicoes_pagamento_do_texto). So existe se pelo menos uma
+    # nota do lote tiver reconhecido algum dado nesse texto. Mantem o
+    # texto original ao lado, para conferencia manual.
+    df_condicoes = None
+    if linhas_condicoes_pagamento:
+        df_condicoes = pd.DataFrame(linhas_condicoes_pagamento)
+        colunas_texto_condicoes = ["Chave de Acesso (chNFe)", "Numero da Nota (nNF)", "Numero do Orcamento"]
+        for coluna in colunas_texto_condicoes:
+            if coluna in df_condicoes.columns:
+                df_condicoes[coluna] = df_condicoes[coluna].astype(str)
+
     extensao = os.path.splitext(arquivo_saida)[1].lower()
 
     if extensao == ".csv":
-        # CSV so suporta uma tabela por arquivo -- a aba de parcelas,
-        # quando existir, vai para um segundo arquivo .csv ao lado.
+        # CSV so suporta uma tabela por arquivo -- as abas extras,
+        # quando existirem, vao para arquivos .csv separados ao lado.
         df.to_csv(arquivo_saida, index=False, sep=";", encoding="utf-8-sig")
         if df_parcelas is not None:
             caminho_parcelas = os.path.splitext(arquivo_saida)[0] + "_fatura_duplicatas.csv"
             df_parcelas.to_csv(caminho_parcelas, index=False, sep=";", encoding="utf-8-sig")
+        if df_condicoes is not None:
+            caminho_condicoes = os.path.splitext(arquivo_saida)[0] + "_condicoes_pagamento.csv"
+            df_condicoes.to_csv(caminho_condicoes, index=False, sep=";", encoding="utf-8-sig")
     else:
         if extensao != ".xlsx":
             arquivo_saida = os.path.splitext(arquivo_saida)[0] + ".xlsx"
@@ -518,9 +659,23 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
                         celula.number_format = "@"
                 formatar_planilha_hec(planilha_parcelas, df_parcelas)
 
+            if df_condicoes is not None:
+                df_condicoes.to_excel(writer, index=False, sheet_name="Condicoes de Pagamento (Texto)")
+                planilha_condicoes = writer.sheets["Condicoes de Pagamento (Texto)"]
+                for coluna in colunas_texto_condicoes:
+                    if coluna not in df_condicoes.columns:
+                        continue
+                    indice_coluna = df_condicoes.columns.get_loc(coluna) + 1
+                    letra_coluna = planilha_condicoes.cell(row=1, column=indice_coluna).column_letter
+                    for linha_num in range(2, len(df_condicoes) + 2):
+                        celula = planilha_condicoes[f"{letra_coluna}{linha_num}"]
+                        celula.number_format = "@"
+                formatar_planilha_hec(planilha_condicoes, df_condicoes)
+
     mensagem = (
         f"Concluido! {len(linhas)} nota(s) fiscal(is) exportada(s) com sucesso"
         + (f", sendo {len(linhas_parcelas)} parcela(s) de fatura/duplicata em {sum(1 for l in linhas if l['Quantidade de Parcelas'] > 0)} nota(s)." if linhas_parcelas else ".")
+        + (f" {len(linhas_condicoes_pagamento)} nota(s) com condicao de pagamento reconhecida no texto de observacoes." if linhas_condicoes_pagamento else "")
         + f"\nArquivo salvo em: {os.path.abspath(arquivo_saida)}"
     )
     callback_log(mensagem)
@@ -528,6 +683,30 @@ def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
 
 
 NOME_ARQUIVO_SAIDA = "resultado_final_XML.xlsx"
+
+
+# Cinza classico do Windows 98 -- pedido do usuario para os botoes do
+# programa terem o visual "retro" (cinza, em relevo/3D, fonte preta).
+CINZA_WIN98 = "#C0C0C0"
+
+
+def criar_botao_win98(parent, texto, comando):
+    """
+    Cria um botao no estilo classico do Windows 98: cinza, com relevo
+    3D (borda clara/escura simulando luz vindo de cima-esquerda) e
+    texto preto. O customtkinter (CTkButton) so desenha botoes "chapados"
+    com cantos arredondados -- nao da pra fazer esse efeito de relevo
+    com ele, entao aqui usamos o tk.Button classico (nao-temático), que
+    e o unico que desenha esse bevel automaticamente via relief="raised".
+    """
+    return tk.Button(
+        parent, text=texto, command=comando,
+        bg=CINZA_WIN98, fg="#000000",
+        activebackground=CINZA_WIN98, activeforeground="#000000",
+        disabledforeground="#808080",
+        font=(FONTE, 12, "bold"), relief="raised", bd=3,
+        highlightthickness=0, cursor="hand2", padx=14, pady=6,
+    )
 
 
 # ====================================================================
@@ -663,10 +842,8 @@ class App(ctk.CTk):
         linha = ctk.CTkFrame(card, fg_color="transparent")
         linha.pack(fill="x", padx=16, pady=(0, 16))
 
-        ctk.CTkButton(linha, text="Selecionar Pasta de Origem...", height=34,
-                      fg_color=VERDE_HEC, hover_color=VERDE_ESCURO,
-                      font=ctk.CTkFont(FONTE, 13, "bold"),
-                      command=self._selecionar_pasta_origem).pack(side="left", padx=(0, 12))
+        criar_botao_win98(linha, "Selecionar Pasta de Origem...",
+                          self._selecionar_pasta_origem).pack(side="left", padx=(0, 12))
 
         self._label_pasta_origem = ctk.CTkLabel(
             linha, text="Nenhuma pasta selecionada.",
@@ -690,10 +867,8 @@ class App(ctk.CTk):
         linha = ctk.CTkFrame(card, fg_color="transparent")
         linha.pack(fill="x", padx=16, pady=(0, 16))
 
-        ctk.CTkButton(linha, text="Selecionar Pasta de Destino...", height=34,
-                      fg_color=VERDE_HEC, hover_color=VERDE_ESCURO,
-                      font=ctk.CTkFont(FONTE, 13, "bold"),
-                      command=self._selecionar_pasta_destino).pack(side="left", padx=(0, 12))
+        criar_botao_win98(linha, "Selecionar Pasta de Destino...",
+                          self._selecionar_pasta_destino).pack(side="left", padx=(0, 12))
 
         self._label_pasta_destino = ctk.CTkLabel(
             linha, text="Nenhuma pasta selecionada.",
@@ -711,28 +886,21 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(card, text="Extrai Chave de Acesso, Numero, Data de Emissao, CNPJ/Nome do Emitente, "
-                                 "Nome e CNPJ/CPF do Comprador, Valor Total, CFOP, Observacoes e Fatura/Duplicatas "
-                                 "(quantidade de parcelas, vencimento e valor) de cada nota -- inclusive as que "
-                                 "estiverem dentro de arquivos .zip.",
+                                 "Nome e CNPJ/CPF do Comprador, Valor Total, CFOP, Observacoes, Fatura/Duplicatas "
+                                 "(quantidade de parcelas, vencimento e valor) e condicoes de pagamento descritas "
+                                 "no texto das observacoes (orcamento, sinal, saldo, a vista) de cada nota -- "
+                                 "inclusive as que estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
         linha_botoes = ctk.CTkFrame(card, fg_color="transparent")
         linha_botoes.pack(fill="x", padx=16, pady=(0, 12))
 
-        self._botao_processar = ctk.CTkButton(
-            linha_botoes, text="Gerar Planilha", height=34,
-            fg_color=VERDE_HEC, hover_color=VERDE_ESCURO,
-            font=ctk.CTkFont(FONTE, 13, "bold"),
-            command=self._iniciar_processamento,
-        )
+        self._botao_processar = criar_botao_win98(
+            linha_botoes, "Gerar Planilha", self._iniciar_processamento)
         self._botao_processar.pack(side="left", padx=(0, 8))
 
-        ctk.CTkButton(linha_botoes, text="Limpar Log", height=34,
-                      fg_color="transparent", border_width=1, border_color=CINZA_HEC,
-                      text_color=CINZA_HEC, hover_color=COR_CARD_ATIVO,
-                      font=ctk.CTkFont(FONTE, 13),
-                      command=self._limpar_log).pack(side="left")
+        criar_botao_win98(linha_botoes, "Limpar Log", self._limpar_log).pack(side="left")
 
         self._texto_log = ctk.CTkTextbox(
             card, height=260, fg_color=COR_FUNDO, text_color=COR_TEXTO,
