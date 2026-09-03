@@ -111,7 +111,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.4"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.5"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -751,23 +751,32 @@ def _escrever_aba_excel(writer, df, nome_aba, colunas_texto):
     formatar_planilha_hec(planilha, df)
 
 
-def gerar_planilha(pasta_xmls, arquivo_saida, callback_log=print):
+def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     """
-    Funcao principal: varre a pasta, processa cada XML -- reconhece
+    Funcao principal: varre a(s) pasta(s), processa cada XML -- reconhece
     NF-e, CT-e e NFS-e Nacional, cada um indo para a sua propria aba --
     e salva o resultado consolidado em Excel (.xlsx) ou CSV, dependendo
     da extensao informada em 'arquivo_saida'. Cada etapa e reportada
     via 'callback_log' (por padrao, print no console).
 
+    'pastas_origem' aceita uma unica pasta (string) ou uma lista de
+    pastas -- quando e uma lista, os XMLs de TODAS elas (e suas
+    subpastas) entram no mesmo resultado consolidado.
+
     Devolve uma tupla (sucesso, mensagem):
         sucesso  -> True/False
         mensagem -> texto explicando o resultado final
     """
-    callback_log(f"Procurando arquivos XML em: {pasta_xmls}")
-    fontes_xml = listar_fontes_xml(pasta_xmls)
+    if isinstance(pastas_origem, str):
+        pastas_origem = [pastas_origem]
+
+    fontes_xml = []
+    for pasta in pastas_origem:
+        callback_log(f"Procurando arquivos XML em: {pasta}")
+        fontes_xml.extend(listar_fontes_xml(pasta))
 
     if not fontes_xml:
-        mensagem = "Nenhum arquivo .xml (solto ou dentro de .zip) foi encontrado na pasta de origem selecionada."
+        mensagem = "Nenhum arquivo .xml (solto ou dentro de .zip) foi encontrado na(s) pasta(s) de origem selecionada(s)."
         callback_log(mensagem)
         return False, mensagem
 
@@ -954,7 +963,7 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-        self.pasta_origem = ""
+        self.pastas_origem = []
         self.pasta_destino = ""
         self._processando = False
 
@@ -1012,7 +1021,7 @@ class App(ctk.CTk):
         zero com as cores novas, preservando pastas ja selecionadas e
         o log atual."""
         estado_salvo = {
-            "pasta_origem": self.pasta_origem,
+            "pastas_origem": list(self.pastas_origem),
             "pasta_destino": self.pasta_destino,
             "log": self._texto_log.get("1.0", "end-1c") if hasattr(self, "_texto_log") else "",
         }
@@ -1029,7 +1038,7 @@ class App(ctk.CTk):
         self._build_menu()
         self._build_area_principal()
 
-        self.pasta_origem = estado_salvo["pasta_origem"]
+        self.pastas_origem = estado_salvo["pastas_origem"]
         self.pasta_destino = estado_salvo["pasta_destino"]
         self._atualizar_labels_pastas()
         if estado_salvo["log"]:
@@ -1051,26 +1060,29 @@ class App(ctk.CTk):
                              border_width=1, corner_radius=10)
         card.pack(fill="x", pady=(0, 14))
 
-        ctk.CTkLabel(card, text="1.  Pasta de origem (onde estao os arquivos XML)",
+        ctk.CTkLabel(card, text="1.  Pasta(s) de origem (onde estao os arquivos XML)",
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
-        ctk.CTkLabel(card, text="Pode conter subpastas -- o programa varre tudo recursivamente, inclusive "
-                                 "XMLs que estiverem dentro de arquivos .zip.",
+        ctk.CTkLabel(card, text="Pode adicionar mais de uma pasta -- os documentos de todas elas entram no "
+                                 "mesmo resultado. Cada pasta pode conter subpastas -- o programa varre tudo "
+                                 "recursivamente, inclusive XMLs que estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
-        linha = ctk.CTkFrame(card, fg_color="transparent")
-        linha.pack(fill="x", padx=16, pady=(0, 16))
+        linha_botoes = ctk.CTkFrame(card, fg_color="transparent")
+        linha_botoes.pack(fill="x", padx=16, pady=(0, 8))
 
-        criar_botao_win98(linha, "Selecionar Pasta de Origem...",
-                          self._selecionar_pasta_origem).pack(side="left", padx=(0, 12))
+        criar_botao_win98(linha_botoes, "Adicionar Pasta de Origem...",
+                          self._selecionar_pasta_origem).pack(side="left", padx=(0, 8))
+        criar_botao_win98(linha_botoes, "Limpar Pastas",
+                          self._limpar_pastas_origem).pack(side="left")
 
         self._label_pasta_origem = ctk.CTkLabel(
-            linha, text="Nenhuma pasta selecionada.",
+            card, text="Nenhuma pasta selecionada.",
             font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
-            justify="left", wraplength=560, anchor="w",
+            justify="left", wraplength=760, anchor="w",
         )
-        self._label_pasta_origem.pack(side="left", fill="x", expand=True)
+        self._label_pasta_origem.pack(anchor="w", padx=16, pady=(0, 16))
 
     def _card_pasta_destino(self, area):
         card = ctk.CTkFrame(area, fg_color=COR_CARD, border_color=COR_BORDA,
@@ -1134,17 +1146,25 @@ class App(ctk.CTk):
 
     # ---------------------------------------------------------------
     def _atualizar_labels_pastas(self):
-        self._label_pasta_origem.configure(
-            text=self.pasta_origem if self.pasta_origem else "Nenhuma pasta selecionada.")
+        if self.pastas_origem:
+            texto = f"{len(self.pastas_origem)} pasta(s) selecionada(s):\n" + "\n".join(
+                f" - {pasta}" for pasta in self.pastas_origem)
+        else:
+            texto = "Nenhuma pasta selecionada."
+        self._label_pasta_origem.configure(text=texto)
         self._label_pasta_destino.configure(
             text=self.pasta_destino if self.pasta_destino else "Nenhuma pasta selecionada.")
 
     def _selecionar_pasta_origem(self):
         pasta = filedialog.askdirectory(
-            parent=self, title="Selecione a PASTA DE ORIGEM (onde estao os arquivos XML)")
-        if pasta:
-            self.pasta_origem = pasta
-            self._label_pasta_origem.configure(text=pasta)
+            parent=self, title="Selecione uma PASTA DE ORIGEM (onde estao os arquivos XML)")
+        if pasta and pasta not in self.pastas_origem:
+            self.pastas_origem.append(pasta)
+            self._atualizar_labels_pastas()
+
+    def _limpar_pastas_origem(self):
+        self.pastas_origem = []
+        self._atualizar_labels_pastas()
 
     def _selecionar_pasta_destino(self):
         pasta = filedialog.askdirectory(
@@ -1169,9 +1189,9 @@ class App(ctk.CTk):
         if self._processando:
             return
 
-        if not self.pasta_origem:
+        if not self.pastas_origem:
             messagebox.showwarning("Pasta de origem nao selecionada",
-                                    "Selecione a pasta de origem (onde estao os arquivos XML) antes de continuar.",
+                                    "Adicione ao menos uma pasta de origem (onde estao os arquivos XML) antes de continuar.",
                                     parent=self)
             return
         if not self.pasta_destino:
@@ -1189,17 +1209,17 @@ class App(ctk.CTk):
         # processa muitos arquivos XML.
         thread = threading.Thread(
             target=self._processar_em_segundo_plano,
-            args=(self.pasta_origem, caminho_saida),
+            args=(list(self.pastas_origem), caminho_saida),
             daemon=True,
         )
         thread.start()
 
-    def _processar_em_segundo_plano(self, pasta_origem, caminho_saida):
+    def _processar_em_segundo_plano(self, pastas_origem, caminho_saida):
         def log_thread_safe(mensagem):
             self.after(0, self._logar, mensagem)
 
         try:
-            sucesso, mensagem = gerar_planilha(pasta_origem, caminho_saida, callback_log=log_thread_safe)
+            sucesso, mensagem = gerar_planilha(pastas_origem, caminho_saida, callback_log=log_thread_safe)
         except Exception as erro:
             sucesso, mensagem = False, f"Erro inesperado ao processar: {erro}"
             log_thread_safe(mensagem)
