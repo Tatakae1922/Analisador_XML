@@ -113,7 +113,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.7"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.8"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -166,6 +166,16 @@ NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 # namespace XML, igual a NF-e.
 NS_CTE = {"cte": "http://www.portalfiscal.inf.br/cte"}
 NS_NFSE = {"nfse": "http://www.sped.fazenda.gov.br/nfse"}
+
+# NFS-e MUNICIPAL no padrao ABRASF -- layout usado pelas prefeituras que
+# ainda tem sistema proprio de nota de servico (inclusive a Nota Fiscal
+# Paulistana, de Sao Paulo), diferente da NFS-e Nacional acima. O mesmo
+# namespace serve para varias cidades; o municipio vem dentro do XML.
+NS_ABRASF = {"a": "http://www.abrasf.org.br/nfse.xsd"}
+
+# Codigo IBGE de Sao Paulo -- usado para identificar a Nota Fiscal
+# Paulistana dentro das NFS-e ABRASF.
+CODIGO_MUNICIPIO_SAO_PAULO = "3550308"
 
 
 def extrair_texto(elemento, caminho, namespaces=NS):
@@ -431,6 +441,25 @@ def extrair_condicoes_pagamento_do_texto(texto_infcpl, valor_total_nota=None):
     return resultado
 
 
+def _caminho_longo_windows(caminho):
+    """
+    O Windows, por padrao, nao abre arquivos cujo caminho completo passe
+    de 260 caracteres -- e as pastas de XML dos clientes chegam nisso
+    facil (ex.: ...\\RelatorioMensal-2026-05_CNPJ_...\\CTe\\CTE\\NF 85884 -
+    BRINKS SEGURANCA E TRANSPORTES ... .xml tem 261). O prefixo "\\\\?\\"
+    (ou "\\\\?\\UNC\\" para pastas de rede \\\\servidor\\...) desliga esse
+    limite. Fora do Windows, devolve o caminho sem mudanca.
+    """
+    if os.name != "nt":
+        return caminho
+    caminho_absoluto = os.path.abspath(caminho)
+    if caminho_absoluto.startswith("\\\\?\\"):
+        return caminho_absoluto
+    if caminho_absoluto.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + caminho_absoluto[2:]
+    return "\\\\?\\" + caminho_absoluto
+
+
 def _ler_xml_da_fonte(fonte, callback_log):
     """
     Le o XML de uma 'fonte' (ver listar_fontes_xml) e devolve uma
@@ -446,23 +475,26 @@ def _ler_xml_da_fonte(fonte, callback_log):
         - uma string: caminho de um arquivo .xml solto no disco
         - uma tupla ("zip", caminho_do_zip, nome_interno): um .xml que
           esta DENTRO de um arquivo .zip, sem precisar extrair primeiro
+
+    Erro de leitura (XML corrompido, arquivo sumiu, sem permissao etc.)
+    vira so um aviso no log -- nunca derruba o processamento do lote.
     """
     if isinstance(fonte, tuple):
         _tipo, caminho_zip, nome_interno = fonte
         nome_exibicao = f"{nome_interno} (dentro de {os.path.basename(caminho_zip)})"
         try:
-            with zipfile.ZipFile(caminho_zip) as arquivo_zip:
+            with zipfile.ZipFile(_caminho_longo_windows(caminho_zip)) as arquivo_zip:
                 conteudo = arquivo_zip.read(nome_interno)
             root = ET.fromstring(conteudo)
-        except (ET.ParseError, zipfile.BadZipFile, KeyError) as erro:
+        except (ET.ParseError, zipfile.BadZipFile, KeyError, OSError) as erro:
             callback_log(f"[AVISO] Nao foi possivel ler o XML '{nome_exibicao}': {erro}")
             return None, nome_exibicao
         return root, nome_exibicao
 
     try:
-        arvore = ET.parse(fonte)
+        arvore = ET.parse(_caminho_longo_windows(fonte))
         root = arvore.getroot()
-    except ET.ParseError as erro:
+    except (ET.ParseError, OSError) as erro:
         callback_log(f"[AVISO] Nao foi possivel ler o XML '{os.path.basename(fonte)}': {erro}")
         return None, os.path.basename(fonte)
     return root, os.path.basename(fonte)
@@ -493,6 +525,8 @@ def identificar_tipo_documento(root):
         return "cte"
     if root.find(".//nfse:infNFSe", NS_NFSE) is not None:
         return "nfse"
+    if root.find(".//a:InfNfse", NS_ABRASF) is not None:
+        return "nfse_abrasf"
     return None
 
 
@@ -672,6 +706,116 @@ def _processar_nfse(root, nome_arquivo):
     }
 
 
+def _processar_nfse_abrasf(root, nome_arquivo):
+    """
+    Extrai os campos de uma NFS-e MUNICIPAL no padrao ABRASF (ex.:
+    Nota Fiscal Paulistana, e notas de servico de Campinas, Guarulhos,
+    Barueri, Rio de Janeiro etc.). Devolve o dicionario de dados, ou
+    None se a tag InfNfse nao for encontrada.
+
+    Cada campo e buscado em mais de um caminho possivel, porque o
+    ABRASF tem duas geracoes de layout: na 2.x os dados do servico e do
+    tomador ficam dentro de DeclaracaoPrestacaoServico, na 1.x ficam
+    direto em InfNfse (Servico / TomadorServico).
+    """
+    inf = root.find(".//a:InfNfse", NS_ABRASF)
+    if inf is None:
+        return None
+
+    def primeiro(*caminhos):
+        for caminho in caminhos:
+            valor = extrair_texto(inf, caminho, NS_ABRASF)
+            if valor:
+                return valor
+        return ""
+
+    data_emissao = primeiro("a:DataEmissao")
+
+    codigo_municipio = primeiro(
+        "a:OrgaoGerador/a:CodigoMunicipio",
+        ".//a:Servico/a:MunicipioIncidencia",
+        ".//a:Servico/a:CodigoMunicipio",
+        "a:PrestadorServico/a:Endereco/a:CodigoMunicipio",
+    )
+    if codigo_municipio == CODIGO_MUNICIPIO_SAO_PAULO:
+        municipio = "SAO PAULO (Nota Fiscal Paulistana)"
+    else:
+        municipio = codigo_municipio
+
+    # A discriminacao costuma vir com varias quebras de linha (formatada
+    # para impressao); junta tudo numa linha so pra caber na celula.
+    discriminacao = " ".join(primeiro(".//a:Servico/a:Discriminacao").split())
+
+    iss_retido = primeiro(".//a:Servico/a:IssRetido")
+    iss_retido = {"1": "Sim", "2": "Nao"}.get(iss_retido, iss_retido)
+
+    return {
+        "Numero da NFS-e": primeiro("a:Numero"),
+        "Codigo de Verificacao": primeiro("a:CodigoVerificacao"),
+        "Data de Emissao": extrair_data_emissao_formatada(data_emissao),
+        "Data/Hora de Emissao": data_emissao,
+        "Competencia": primeiro(".//a:InfDeclaracaoPrestacaoServico/a:Competencia", "a:Competencia"),
+        "Municipio": municipio,
+        "CNPJ/CPF Prestador": primeiro(
+            "a:PrestadorServico/a:IdentificacaoPrestador/a:CpfCnpj/a:Cnpj",
+            "a:PrestadorServico/a:IdentificacaoPrestador/a:CpfCnpj/a:Cpf",
+            "a:PrestadorServico/a:IdentificacaoPrestador/a:Cnpj",
+            ".//a:Prestador/a:CpfCnpj/a:Cnpj",
+            ".//a:Prestador/a:CpfCnpj/a:Cpf",
+        ),
+        "Nome Prestador": primeiro("a:PrestadorServico/a:RazaoSocial"),
+        "CNPJ/CPF Tomador": primeiro(
+            ".//a:Tomador/a:IdentificacaoTomador/a:CpfCnpj/a:Cnpj",
+            ".//a:Tomador/a:IdentificacaoTomador/a:CpfCnpj/a:Cpf",
+            ".//a:TomadorServico/a:IdentificacaoTomador/a:CpfCnpj/a:Cnpj",
+            ".//a:TomadorServico/a:IdentificacaoTomador/a:CpfCnpj/a:Cpf",
+        ),
+        "Nome Tomador": primeiro(".//a:Tomador/a:RazaoSocial", ".//a:TomadorServico/a:RazaoSocial"),
+        "Item da Lista de Servico": primeiro(".//a:Servico/a:ItemListaServico"),
+        "Descricao do Servico (Discriminacao)": discriminacao,
+        "Valor dos Servicos": primeiro(".//a:Servico/a:Valores/a:ValorServicos"),
+        "Base de Calculo ISS": primeiro("a:ValoresNfse/a:BaseCalculo", ".//a:Servico/a:Valores/a:BaseCalculo"),
+        "Aliquota ISS": primeiro("a:ValoresNfse/a:Aliquota", ".//a:Servico/a:Valores/a:Aliquota"),
+        "Valor do ISS": primeiro("a:ValoresNfse/a:ValorIss", ".//a:Servico/a:Valores/a:ValorIss"),
+        "ISS Retido": iss_retido,
+        # Retencoes federais -- so vem preenchidas quando o tomador retem
+        # o tributo; em branco = nao houve retencao informada na nota.
+        "PIS Retido": primeiro(".//a:Servico/a:Valores/a:ValorPis"),
+        "COFINS Retido": primeiro(".//a:Servico/a:Valores/a:ValorCofins"),
+        "CSLL Retido": primeiro(".//a:Servico/a:Valores/a:ValorCsll"),
+        "IR Retido": primeiro(".//a:Servico/a:Valores/a:ValorIr"),
+        "INSS Retido": primeiro(".//a:Servico/a:Valores/a:ValorInss"),
+        # Muitas prefeituras (inclusive SP, em boa parte das notas) NAO
+        # informam o valor liquido -- nesse caso a celula fica em branco
+        # (nao e calculado aqui, para nao mostrar um valor que nao esta
+        # na nota).
+        "Valor Liquido": primeiro("a:ValoresNfse/a:ValorLiquidoNfse", ".//a:Servico/a:Valores/a:ValorLiquidoNfse"),
+        "Arquivo de Origem": nome_arquivo,
+    }
+
+
+def _chave_unica_documento(tipo, dados):
+    """
+    Identificador unico de um documento fiscal, para detectar o MESMO
+    documento lido mais de uma vez (ex.: o XML solto na pasta e a
+    copia dele dentro de um .zip, ou pastas copiadas). Devolve None se
+    o documento nao tiver chave (nesse caso nao da pra afirmar que e
+    repetido, entao ele entra normalmente).
+    """
+    if tipo in ("nfe", "nfce"):
+        chave = dados.get("Chave de Acesso (chNFe)")
+    elif tipo == "cte":
+        chave = dados.get("Chave de Acesso (chCTe)")
+    elif tipo == "nfse":
+        chave = dados.get("Chave/Id da NFS-e")
+    elif tipo == "nfse_abrasf":
+        partes = [dados.get("CNPJ/CPF Prestador"), dados.get("Numero da NFS-e"), dados.get("Codigo de Verificacao")]
+        chave = "|".join(partes) if all(partes) else None
+    else:
+        chave = None
+    return f"{tipo}:{chave}" if chave else None
+
+
 def processar_arquivo_xml(fonte, callback_log=print):
     """
     Le um XML e devolve uma tupla
@@ -732,6 +876,13 @@ def processar_arquivo_xml(fonte, callback_log=print):
             return None, None, [], None, []
         return "nfse", dados, [], None, []
 
+    if tipo == "nfse_abrasf":
+        dados = _processar_nfse_abrasf(root, nome_arquivo)
+        if dados is None:
+            callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser uma NFS-e municipal valida (tag InfNfse nao encontrada).")
+            return None, None, [], None, []
+        return "nfse_abrasf", dados, [], None, []
+
     callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao e um XML de NF-e, NFC-e, CT-e ou NFS-e reconhecido.")
     return None, None, [], None, []
 
@@ -750,7 +901,11 @@ def listar_fontes_xml(pasta):
           DENTRO do zip, ex.: "notas/3016.xml")
     """
     fontes_encontradas = []
-    for pasta_atual, _subpastas, arquivos in os.walk(pasta):
+    # A varredura parte do caminho ja com o prefixo de caminho longo (ver
+    # _caminho_longo_windows) -- sem isso, o os.walk PULA EM SILENCIO as
+    # subpastas que passam de 260 caracteres, e os XMLs delas nem
+    # chegariam a ser lidos.
+    for pasta_atual, _subpastas, arquivos in os.walk(_caminho_longo_windows(pasta)):
         for nome_arquivo in arquivos:
             caminho_completo = os.path.join(pasta_atual, nome_arquivo)
             if nome_arquivo.lower().endswith(".xml"):
@@ -761,8 +916,8 @@ def listar_fontes_xml(pasta):
                         for nome_interno in arquivo_zip.namelist():
                             if nome_interno.lower().endswith(".xml"):
                                 fontes_encontradas.append(("zip", caminho_completo, nome_interno))
-                except zipfile.BadZipFile:
-                    pass  # zip corrompido/invalido -- ignora, sem travar o resto do processamento
+                except (zipfile.BadZipFile, OSError):
+                    pass  # zip corrompido/invalido/ilegivel -- ignora, sem travar o resto do processamento
     return fontes_encontradas
 
 
@@ -859,13 +1014,27 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     linhas_nfce = []
     linhas_cte = []
     linhas_nfse = []
+    linhas_nfse_abrasf = []
     linhas_parcelas = []
     linhas_condicoes_pagamento = []
     linhas_itens = []
+    chaves_ja_lidas = set()
+    quantidade_repetidos = 0
     for fonte in fontes_xml:
         nome_para_log = f"{fonte[2]} (dentro de {os.path.basename(fonte[1])})" if isinstance(fonte, tuple) else os.path.basename(fonte)
         callback_log(f"Lendo: {nome_para_log}")
         tipo, dados, parcelas_da_nota, condicao_pagamento, itens_da_nota = processar_arquivo_xml(fonte, callback_log=callback_log)
+
+        # Mesmo documento lido de novo (outra copia do XML) -- ignora
+        # inteiro (inclusive itens/parcelas), senao os valores somam em
+        # dobro na planilha.
+        chave_unica = _chave_unica_documento(tipo, dados) if tipo else None
+        if chave_unica is not None:
+            if chave_unica in chaves_ja_lidas:
+                quantidade_repetidos += 1
+                continue
+            chaves_ja_lidas.add(chave_unica)
+
         if tipo == "nfe":
             linhas_nfe.append(dados)
             linhas_parcelas.extend(parcelas_da_nota)
@@ -882,8 +1051,10 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
             linhas_cte.append(dados)
         elif tipo == "nfse":
             linhas_nfse.append(dados)
+        elif tipo == "nfse_abrasf":
+            linhas_nfse_abrasf.append(dados)
 
-    if not linhas_nfe and not linhas_nfce and not linhas_cte and not linhas_nfse:
+    if not (linhas_nfe or linhas_nfce or linhas_cte or linhas_nfse or linhas_nfse_abrasf):
         mensagem = "Nenhum documento valido (NF-e, NFC-e, CT-e ou NFS-e) foi extraido dos XMLs encontrados. Nada foi salvo."
         callback_log(mensagem)
         return False, mensagem
@@ -965,6 +1136,17 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
                        "Valor do ISS (vISSQN)", "Valor Liquido (vLiq)"]:
             df_nfse[coluna] = pd.to_numeric(df_nfse[coluna], errors="coerce")
 
+    # ---- NFS-e Municipal (ABRASF / Nota Fiscal Paulistana) ----------------
+    df_nfse_abrasf = None
+    colunas_texto_nfse_abrasf = ["Numero da NFS-e", "Codigo de Verificacao", "CNPJ/CPF Prestador",
+                                  "CNPJ/CPF Tomador", "Item da Lista de Servico", "Municipio"]
+    if linhas_nfse_abrasf:
+        df_nfse_abrasf = pd.DataFrame(linhas_nfse_abrasf)
+        _forcar_colunas_como_texto(df_nfse_abrasf, colunas_texto_nfse_abrasf)
+        for coluna in ["Valor dos Servicos", "Base de Calculo ISS", "Aliquota ISS", "Valor do ISS",
+                       "PIS Retido", "COFINS Retido", "CSLL Retido", "IR Retido", "INSS Retido", "Valor Liquido"]:
+            df_nfse_abrasf[coluna] = pd.to_numeric(df_nfse_abrasf[coluna], errors="coerce")
+
     extensao = os.path.splitext(arquivo_saida)[1].lower()
 
     # Cada aba que existir vira um arquivo -- a primeira da lista usa o
@@ -973,7 +1155,8 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         ("NFe", df_nfe, colunas_texto_nfe, ""),
         ("NFC-e (Cupom Fiscal)", df_nfce, colunas_texto_nfe, "_nfce"),
         ("CT-e", df_cte, colunas_texto_cte, "_cte"),
-        ("NFS-e", df_nfse, colunas_texto_nfse, "_nfse"),
+        ("NFS-e Nacional", df_nfse, colunas_texto_nfse, "_nfse"),
+        ("NFS-e Municipal (ABRASF)", df_nfse_abrasf, colunas_texto_nfse_abrasf, "_nfse_municipal"),
         ("Itens da Nota", df_itens, colunas_texto_itens, "_itens"),
         ("Fatura e Duplicatas", df_parcelas, colunas_texto_parcelas, "_fatura_duplicatas"),
         ("Condicoes de Pagamento (Texto)", df_condicoes, colunas_texto_condicoes, "_condicoes_pagamento"),
@@ -1005,7 +1188,10 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     if linhas_cte:
         partes_resumo.append(f"{len(linhas_cte)} CT-e")
     if linhas_nfse:
-        partes_resumo.append(f"{len(linhas_nfse)} NFS-e")
+        partes_resumo.append(f"{len(linhas_nfse)} NFS-e Nacional")
+    if linhas_nfse_abrasf:
+        quantidade_paulistana = sum(1 for l in linhas_nfse_abrasf if l["Municipio"].startswith("SAO PAULO"))
+        partes_resumo.append(f"{len(linhas_nfse_abrasf)} NFS-e Municipal ({quantidade_paulistana} Paulistana)")
 
     quantidade_com_parcelas = sum(1 for l in linhas_nfe + linhas_nfce if l["Quantidade de Parcelas"] > 0)
     mensagem = (
@@ -1014,6 +1200,8 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         + (f", sendo {len(linhas_parcelas)} parcela(s) de fatura/duplicata em "
            f"{quantidade_com_parcelas} nota(s)." if linhas_parcelas else ".")
         + (f" {len(linhas_condicoes_pagamento)} nota(s) com condicao de pagamento reconhecida no texto de observacoes." if linhas_condicoes_pagamento else "")
+        + (f" {quantidade_repetidos} arquivo(s) repetido(s) (mesmo documento em mais de um XML/.zip) foram ignorados "
+           f"para nao contar em dobro." if quantidade_repetidos else "")
         + f"\nArquivo salvo em: {os.path.abspath(arquivo_saida)}"
     )
     callback_log(mensagem)
@@ -1226,16 +1414,19 @@ class App(ctk.CTk):
         ctk.CTkLabel(card, text="3.  Processar e gerar a planilha",
                      font=ctk.CTkFont(FONTE, 16, "bold"),
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
-        ctk.CTkLabel(card, text="Reconhece NF-e, NFC-e (Cupom Fiscal), CT-e e NFS-e Nacional (cada um numa aba "
-                                 "propria da planilha). Da NF-e/NFC-e extrai Chave de Acesso, Numero, Data de "
+        ctk.CTkLabel(card, text="Reconhece NF-e, NFC-e (Cupom Fiscal), CT-e, NFS-e Nacional e NFS-e Municipal "
+                                 "(padrao ABRASF, incluindo a Nota Fiscal Paulistana), cada um numa aba propria da "
+                                 "planilha. Documentos repetidos (o mesmo XML solto e dentro de .zip, por exemplo) "
+                                 "sao contados uma vez so. Da NF-e/NFC-e extrai Chave de Acesso, Numero, Data de "
                                  "Emissao, CNPJ/Nome do Emitente, Nome e CNPJ/CPF do Comprador, Descricao dos "
                                  "Produtos, Valor Total, CFOP, Observacoes, Fatura/Duplicatas (quantidade de "
                                  "parcelas, vencimento e valor) e condicoes de pagamento descritas no texto das "
                                  "observacoes (orcamento, sinal, saldo, a vista) -- alem de uma aba 'Itens da Nota' "
                                  "com uma linha por produto (codigo, descricao, NCM, CFOP, quantidade e valores). "
                                  "Do CT-e extrai dados do transporte (transportadora, remetente, "
-                                 "destinatario, valores, vencimento). Da NFS-e extrai prestador, tomador, servico e "
-                                 "valores/ISS -- inclusive documentos que estiverem dentro de arquivos .zip.",
+                                 "destinatario, valores, vencimento). Das NFS-e extrai prestador, tomador, municipio, "
+                                 "descricao do servico, valores/ISS e retencoes federais -- inclusive documentos que "
+                                 "estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
