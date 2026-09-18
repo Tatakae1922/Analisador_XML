@@ -113,7 +113,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.6"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.7"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -242,6 +242,58 @@ def extrair_cfops(inf_nfe):
             if cfop and cfop not in cfops_encontrados:
                 cfops_encontrados.append(cfop)
     return " / ".join(cfops_encontrados)
+
+
+def extrair_descricao_produtos(inf_nfe):
+    """
+    Cada item da nota (tag <det>) tem a descricao do produto/servico
+    em <det><prod><xProd>. Essa funcao junta a descricao de TODOS os
+    itens numa unica string, separadas por " / " -- assim a planilha
+    mostra, numa coluna so, tudo o que foi vendido naquela nota.
+
+    Diferente do CFOP (ver extrair_cfops), aqui as repeticoes NAO sao
+    removidas: se a nota tem o mesmo produto em dois itens diferentes
+    (ex.: mesma bebida em dois lancamentos), os dois aparecem, porque
+    representam linhas reais da nota.
+    """
+    descricoes = []
+    for produto in inf_nfe.findall(".//nfe:det/nfe:prod/nfe:xProd", NS):
+        if produto.text and produto.text.strip():
+            descricoes.append(produto.text.strip())
+    return " / ".join(descricoes)
+
+
+def extrair_itens_nfe(inf_nfe, nome_arquivo, chave_acesso, numero_nota):
+    """
+    Devolve uma lista de dicts, UMA LINHA POR ITEM da nota (cada tag
+    <det>), com codigo, descricao, NCM, CFOP, unidade, quantidade e
+    valores do item. Alimenta a aba "Itens da Nota" da planilha.
+
+    Ter uma linha por item (em vez de tudo espremido numa celula so)
+    e o que permite, no Excel, filtrar por produto, somar por NCM ou
+    por CFOP e conferir item a item -- mesma ideia da aba "Fatura e
+    Duplicatas", que tem uma linha por parcela.
+    """
+    linhas_itens = []
+    for indice, det in enumerate(inf_nfe.findall("nfe:det", NS), start=1):
+        # O numero do item vem no atributo nItem de <det>; se vier
+        # vazio (nota fora do padrao), cai na contagem sequencial.
+        numero_item = det.get("nItem") or str(indice)
+        linhas_itens.append({
+            "Arquivo de Origem": nome_arquivo,
+            "Chave de Acesso (chNFe)": chave_acesso,
+            "Numero da Nota (nNF)": numero_nota,
+            "Item": numero_item,
+            "Codigo do Produto (cProd)": extrair_texto(det, "nfe:prod/nfe:cProd"),
+            "Descricao (xProd)": extrair_texto(det, "nfe:prod/nfe:xProd"),
+            "NCM": extrair_texto(det, "nfe:prod/nfe:NCM"),
+            "CFOP": extrair_texto(det, "nfe:prod/nfe:CFOP"),
+            "Unidade (uCom)": extrair_texto(det, "nfe:prod/nfe:uCom"),
+            "Quantidade (qCom)": extrair_texto(det, "nfe:prod/nfe:qCom"),
+            "Valor Unitario (vUnCom)": extrair_texto(det, "nfe:prod/nfe:vUnCom"),
+            "Valor Total do Item (vProd)": extrair_texto(det, "nfe:prod/nfe:vProd"),
+        })
+    return linhas_itens
 
 
 def extrair_cnpj_cpf_destinatario(inf_nfe):
@@ -447,14 +499,14 @@ def identificar_tipo_documento(root):
 def _processar_nfe(root, nome_arquivo):
     """
     Extrai os campos de uma NF-e ja identificada. Devolve uma tupla
-    (dados, linhas_parcelas, linha_condicao_pagamento) -- ver
-    processar_arquivo_xml. 'dados' vem None se a tag infNFe nao for
+    (dados, linhas_parcelas, linha_condicao_pagamento, linhas_itens) --
+    ver processar_arquivo_xml. 'dados' vem None se a tag infNFe nao for
     encontrada (nao deveria acontecer, ja que identificar_tipo_documento
     ja confirmou -- e so uma segunda checagem defensiva).
     """
     inf_nfe = root.find(".//nfe:infNFe", NS)
     if inf_nfe is None:
-        return None, [], None
+        return None, [], None, []
 
     dhEmi = extrair_texto(inf_nfe, "nfe:ide/nfe:dhEmi")
     chave_acesso = extrair_chave_acesso(root)
@@ -477,6 +529,7 @@ def _processar_nfe(root, nome_arquivo):
         "Nome Emitente (xNome)": extrair_texto(inf_nfe, "nfe:emit/nfe:xNome"),
         "Nome do Comprador (dest/xNome)": extrair_texto(inf_nfe, "nfe:dest/nfe:xNome"),
         "CNPJ/CPF do Comprador": extrair_cnpj_cpf_destinatario(inf_nfe),
+        "Descricao dos Produtos": extrair_descricao_produtos(inf_nfe),
         "Valor Total da Nota (vNF)": texto_valor_total_nota,
         "CFOP": extrair_cfops(inf_nfe),
         # infCpl fica dentro de <infAdic>, por isso o caminho tem os dois niveis:
@@ -515,7 +568,9 @@ def _processar_nfe(root, nome_arquivo):
             "Texto Original (infCpl)": texto_infcpl,
         }
 
-    return dados, linhas_parcelas, linha_condicao_pagamento
+    linhas_itens = extrair_itens_nfe(inf_nfe, nome_arquivo, chave_acesso, numero_nota)
+
+    return dados, linhas_parcelas, linha_condicao_pagamento, linhas_itens
 
 
 def _processar_cte(root, nome_arquivo):
@@ -636,8 +691,11 @@ def processar_arquivo_xml(fonte, callback_log=print):
                                       reconhecida no texto -- so
                                       preenchida para NF-e/NFC-e, None
                                       para os demais
+        linhas_itens              -> lista de dicts, uma por item/produto
+                                      da nota -- so preenchida para
+                                      NF-e/NFC-e, vazia para os demais
 
-    Quando 'tipo_documento' vem None, os demais valores vem None/[]/None.
+    Quando 'tipo_documento' vem None, os demais valores vem None/[]/None/[].
 
     'fonte' aceita dois formatos (ver listar_fontes_xml):
         - uma string: caminho de um arquivo .xml solto no disco
@@ -646,36 +704,36 @@ def processar_arquivo_xml(fonte, callback_log=print):
     """
     root, nome_arquivo = _ler_xml_da_fonte(fonte, callback_log)
     if root is None:
-        return None, None, [], None
+        return None, None, [], None, []
 
     tipo = identificar_tipo_documento(root)
 
     if tipo in ("nfe", "nfce"):
         # NFC-e (Cupom Fiscal) usa exatamente a mesma extracao da NF-e
         # -- so muda a aba pra onde vai (ver identificar_tipo_documento).
-        dados, linhas_parcelas, linha_condicao = _processar_nfe(root, nome_arquivo)
+        dados, linhas_parcelas, linha_condicao, linhas_itens = _processar_nfe(root, nome_arquivo)
         if dados is None:
             nome_tipo = "NFC-e" if tipo == "nfce" else "NF-e"
             callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser uma {nome_tipo} valida (tag infNFe nao encontrada).")
-            return None, None, [], None
-        return tipo, dados, linhas_parcelas, linha_condicao
+            return None, None, [], None, []
+        return tipo, dados, linhas_parcelas, linha_condicao, linhas_itens
 
     if tipo == "cte":
         dados = _processar_cte(root, nome_arquivo)
         if dados is None:
             callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser um CT-e valido (tag infCte nao encontrada).")
-            return None, None, [], None
-        return "cte", dados, [], None
+            return None, None, [], None, []
+        return "cte", dados, [], None, []
 
     if tipo == "nfse":
         dados = _processar_nfse(root, nome_arquivo)
         if dados is None:
             callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao parece ser uma NFS-e valida (tag infNFSe nao encontrada).")
-            return None, None, [], None
-        return "nfse", dados, [], None
+            return None, None, [], None, []
+        return "nfse", dados, [], None, []
 
     callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao e um XML de NF-e, NFC-e, CT-e ou NFS-e reconhecido.")
-    return None, None, [], None
+    return None, None, [], None, []
 
 
 def listar_fontes_xml(pasta):
@@ -803,18 +861,21 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     linhas_nfse = []
     linhas_parcelas = []
     linhas_condicoes_pagamento = []
+    linhas_itens = []
     for fonte in fontes_xml:
         nome_para_log = f"{fonte[2]} (dentro de {os.path.basename(fonte[1])})" if isinstance(fonte, tuple) else os.path.basename(fonte)
         callback_log(f"Lendo: {nome_para_log}")
-        tipo, dados, parcelas_da_nota, condicao_pagamento = processar_arquivo_xml(fonte, callback_log=callback_log)
+        tipo, dados, parcelas_da_nota, condicao_pagamento, itens_da_nota = processar_arquivo_xml(fonte, callback_log=callback_log)
         if tipo == "nfe":
             linhas_nfe.append(dados)
             linhas_parcelas.extend(parcelas_da_nota)
+            linhas_itens.extend(itens_da_nota)
             if condicao_pagamento is not None:
                 linhas_condicoes_pagamento.append(condicao_pagamento)
         elif tipo == "nfce":
             linhas_nfce.append(dados)
             linhas_parcelas.extend(parcelas_da_nota)
+            linhas_itens.extend(itens_da_nota)
             if condicao_pagamento is not None:
                 linhas_condicoes_pagamento.append(condicao_pagamento)
         elif tipo == "cte":
@@ -834,11 +895,14 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     df_nfce = None
     df_parcelas = None
     df_condicoes = None
+    df_itens = None
     colunas_texto_nfe = ["Chave de Acesso (chNFe)", "CNPJ Emitente", "Numero da Nota (nNF)", "CFOP",
                           "CNPJ/CPF do Comprador", "Numero da Fatura (nFat)"]
     colunas_texto_parcelas = ["Chave de Acesso (chNFe)", "Numero da Nota (nNF)",
                                "Numero da Fatura (nFat)", "Numero da Parcela (nDup)"]
     colunas_texto_condicoes = ["Chave de Acesso (chNFe)", "Numero da Nota (nNF)", "Numero do Orcamento"]
+    colunas_texto_itens = ["Chave de Acesso (chNFe)", "Numero da Nota (nNF)", "Item",
+                            "Codigo do Produto (cProd)", "NCM", "CFOP"]
 
     if linhas_nfe:
         df_nfe = pd.DataFrame(linhas_nfe)
@@ -871,6 +935,15 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         df_condicoes = pd.DataFrame(linhas_condicoes_pagamento)
         _forcar_colunas_como_texto(df_condicoes, colunas_texto_condicoes)
 
+    # Aba separada "Itens da Nota" -- uma linha por ITEM/produto das
+    # NF-e/NFC-e do lote (ver extrair_itens_nfe). Quantidade e valores
+    # ficam numericos para permitir soma/filtro direto no Excel.
+    if linhas_itens:
+        df_itens = pd.DataFrame(linhas_itens)
+        _forcar_colunas_como_texto(df_itens, colunas_texto_itens)
+        for coluna in ["Quantidade (qCom)", "Valor Unitario (vUnCom)", "Valor Total do Item (vProd)"]:
+            df_itens[coluna] = pd.to_numeric(df_itens[coluna], errors="coerce")
+
     # ---- CT-e ----------------------------------------------------------
     df_cte = None
     colunas_texto_cte = ["Chave de Acesso (chCTe)", "Numero do CT-e (nCT)", "CFOP",
@@ -901,6 +974,7 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         ("NFC-e (Cupom Fiscal)", df_nfce, colunas_texto_nfe, "_nfce"),
         ("CT-e", df_cte, colunas_texto_cte, "_cte"),
         ("NFS-e", df_nfse, colunas_texto_nfse, "_nfse"),
+        ("Itens da Nota", df_itens, colunas_texto_itens, "_itens"),
         ("Fatura e Duplicatas", df_parcelas, colunas_texto_parcelas, "_fatura_duplicatas"),
         ("Condicoes de Pagamento (Texto)", df_condicoes, colunas_texto_condicoes, "_condicoes_pagamento"),
     ]
@@ -936,6 +1010,7 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     quantidade_com_parcelas = sum(1 for l in linhas_nfe + linhas_nfce if l["Quantidade de Parcelas"] > 0)
     mensagem = (
         f"Concluido! {', '.join(partes_resumo)} exportado(s) com sucesso"
+        + (f", com {len(linhas_itens)} item(ns)/produto(s) detalhado(s) na aba 'Itens da Nota'" if linhas_itens else "")
         + (f", sendo {len(linhas_parcelas)} parcela(s) de fatura/duplicata em "
            f"{quantidade_com_parcelas} nota(s)." if linhas_parcelas else ".")
         + (f" {len(linhas_condicoes_pagamento)} nota(s) com condicao de pagamento reconhecida no texto de observacoes." if linhas_condicoes_pagamento else "")
@@ -1153,10 +1228,12 @@ class App(ctk.CTk):
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(card, text="Reconhece NF-e, NFC-e (Cupom Fiscal), CT-e e NFS-e Nacional (cada um numa aba "
                                  "propria da planilha). Da NF-e/NFC-e extrai Chave de Acesso, Numero, Data de "
-                                 "Emissao, CNPJ/Nome do Emitente, Nome e CNPJ/CPF do Comprador, Valor Total, CFOP, "
-                                 "Observacoes, Fatura/Duplicatas (quantidade de parcelas, vencimento e valor) e "
-                                 "condicoes de pagamento descritas no texto das observacoes (orcamento, sinal, "
-                                 "saldo, a vista). Do CT-e extrai dados do transporte (transportadora, remetente, "
+                                 "Emissao, CNPJ/Nome do Emitente, Nome e CNPJ/CPF do Comprador, Descricao dos "
+                                 "Produtos, Valor Total, CFOP, Observacoes, Fatura/Duplicatas (quantidade de "
+                                 "parcelas, vencimento e valor) e condicoes de pagamento descritas no texto das "
+                                 "observacoes (orcamento, sinal, saldo, a vista) -- alem de uma aba 'Itens da Nota' "
+                                 "com uma linha por produto (codigo, descricao, NCM, CFOP, quantidade e valores). "
+                                 "Do CT-e extrai dados do transporte (transportadora, remetente, "
                                  "destinatario, valores, vencimento). Da NFS-e extrai prestador, tomador, servico e "
                                  "valores/ISS -- inclusive documentos que estiverem dentro de arquivos .zip.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
