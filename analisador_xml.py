@@ -22,8 +22,13 @@ so vai para a aba "NFC-e (Cupom Fiscal)" em vez de "NFe"):
     - vNF     -> Valor Total da Nota Fiscal
     - CFOP    -> CFOP(s) dos itens da nota (um ou mais, separados por " / ")
     - dest/xNome -> Nome do Comprador/Destinatario
-    - dest/CNPJ ou dest/CPF -> CNPJ/CPF do Comprador/Destinatario
+    - dest/CNPJ, dest/CPF ou dest/idEstrangeiro -> documento do
+                    Comprador/Destinatario (idEstrangeiro nas exportacoes)
     - infCpl  -> Informacoes Complementares (observacoes da nota)
+    - infAdFisco -> Informacoes Adicionais de Interesse do Fisco (o
+                    DANFE mostra junto com o infCpl, na mesma caixa de
+                    "Dados Adicionais" -- e onde ficam, por exemplo, as
+                    fundamentacoes legais das notas de exportacao)
     - cobr/fat/nFat -> Numero da Fatura/Duplicata (quando a nota tem)
     - cobr/dup      -> Parcelas (numero, vencimento e valor) -- vao para
                        uma aba separada "Fatura e Duplicatas", uma linha
@@ -113,7 +118,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.8"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v01.9"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -309,14 +314,19 @@ def extrair_itens_nfe(inf_nfe, nome_arquivo, chave_acesso, numero_nota):
 def extrair_cnpj_cpf_destinatario(inf_nfe):
     """
     O destinatario (comprador) pode ser identificado por CNPJ (pessoa
-    juridica) ou CPF (pessoa fisica) -- a NF-e so preenche um dos dois
-    campos, nunca os dois. Essa funcao tenta o CNPJ primeiro e, se nao
-    encontrar, cai para o CPF.
+    juridica), CPF (pessoa fisica) ou, nas EXPORTACOES (CFOP 7xxx),
+    por idEstrangeiro -- que e o documento do comprador no exterior. A
+    NF-e preenche so um dos tres. Essa funcao tenta nessa ordem.
+
+    Obs.: em exportacao o idEstrangeiro pode vir vazio no XML (o
+    emissor nao e obrigado a informar), e nesse caso a coluna fica em
+    branco mesmo -- o comprador so aparece pelo nome (dest/xNome).
     """
-    cnpj = extrair_texto(inf_nfe, "nfe:dest/nfe:CNPJ")
-    if cnpj:
-        return cnpj
-    return extrair_texto(inf_nfe, "nfe:dest/nfe:CPF")
+    for caminho in ("nfe:dest/nfe:CNPJ", "nfe:dest/nfe:CPF", "nfe:dest/nfe:idEstrangeiro"):
+        valor = extrair_texto(inf_nfe, caminho)
+        if valor:
+            return valor
+    return ""
 
 
 def extrair_fatura_e_duplicatas(inf_nfe):
@@ -546,6 +556,14 @@ def _processar_nfe(root, nome_arquivo):
     chave_acesso = extrair_chave_acesso(root)
     numero_nota = extrair_texto(inf_nfe, "nfe:ide/nfe:nNF")
     texto_infcpl = extrair_texto(inf_nfe, "nfe:infAdic/nfe:infCpl")
+    # O bloco <infAdic> ("Dados Adicionais" do DANFE) tem DOIS campos de
+    # texto, e o DANFE impresso mostra os dois na mesma caixa:
+    #   infCpl      -> Informacoes Complementares (de interesse do contribuinte)
+    #   infAdFisco  -> Informacoes Adicionais de Interesse do Fisco
+    # Ler so o infCpl deixava de fora, por exemplo, a fundamentacao legal
+    # das notas de exportacao (imunidade de IPI, nao incidencia de ICMS,
+    # isencao de PIS/COFINS), que o emissor costuma por no infAdFisco.
+    texto_inf_fisco = extrair_texto(inf_nfe, "nfe:infAdic/nfe:infAdFisco")
     texto_valor_total_nota = extrair_texto(inf_nfe, "nfe:total/nfe:ICMSTot/nfe:vNF")
     try:
         valor_total_nota = float(texto_valor_total_nota) if texto_valor_total_nota else None
@@ -563,11 +581,16 @@ def _processar_nfe(root, nome_arquivo):
         "Nome Emitente (xNome)": extrair_texto(inf_nfe, "nfe:emit/nfe:xNome"),
         "Nome do Comprador (dest/xNome)": extrair_texto(inf_nfe, "nfe:dest/nfe:xNome"),
         "CNPJ/CPF do Comprador": extrair_cnpj_cpf_destinatario(inf_nfe),
+        # Nas exportacoes (CFOP 7xxx) o comprador fica no exterior --
+        # essa coluna mostra o pais (nas vendas internas vem "BRASIL"
+        # ou em branco).
+        "Pais do Comprador": extrair_texto(inf_nfe, "nfe:dest/nfe:enderDest/nfe:xPais"),
         "Descricao dos Produtos": extrair_descricao_produtos(inf_nfe),
         "Valor Total da Nota (vNF)": texto_valor_total_nota,
         "CFOP": extrair_cfops(inf_nfe),
         # infCpl fica dentro de <infAdic>, por isso o caminho tem os dois niveis:
         "Informacoes Complementares (infCpl)": texto_infcpl,
+        "Informacoes ao Fisco (infAdFisco)": texto_inf_fisco,
         "Numero da Fatura (nFat)": numero_fatura,
         "Quantidade de Parcelas": len(lista_parcelas),
         "Arquivo de Origem": nome_arquivo,
@@ -773,6 +796,8 @@ def _processar_nfse_abrasf(root, nome_arquivo):
         "Nome Tomador": primeiro(".//a:Tomador/a:RazaoSocial", ".//a:TomadorServico/a:RazaoSocial"),
         "Item da Lista de Servico": primeiro(".//a:Servico/a:ItemListaServico"),
         "Descricao do Servico (Discriminacao)": discriminacao,
+        # Equivalente municipal das "Informacoes Complementares" da NF-e.
+        "Outras Informacoes": " ".join(primeiro("a:OutrasInformacoes").split()),
         "Valor dos Servicos": primeiro(".//a:Servico/a:Valores/a:ValorServicos"),
         "Base de Calculo ISS": primeiro("a:ValoresNfse/a:BaseCalculo", ".//a:Servico/a:Valores/a:BaseCalculo"),
         "Aliquota ISS": primeiro("a:ValoresNfse/a:Aliquota", ".//a:Servico/a:Valores/a:Aliquota"),
@@ -1419,7 +1444,8 @@ class App(ctk.CTk):
                                  "planilha. Documentos repetidos (o mesmo XML solto e dentro de .zip, por exemplo) "
                                  "sao contados uma vez so. Da NF-e/NFC-e extrai Chave de Acesso, Numero, Data de "
                                  "Emissao, CNPJ/Nome do Emitente, Nome e CNPJ/CPF do Comprador, Descricao dos "
-                                 "Produtos, Valor Total, CFOP, Observacoes, Fatura/Duplicatas (quantidade de "
+                                 "Produtos, Valor Total, CFOP, os DOIS campos de Dados Adicionais (Informacoes "
+                                 "Complementares e Informacoes ao Fisco), pais do comprador, Fatura/Duplicatas (quantidade de "
                                  "parcelas, vencimento e valor) e condicoes de pagamento descritas no texto das "
                                  "observacoes (orcamento, sinal, saldo, a vista) -- alem de uma aba 'Itens da Nota' "
                                  "com uma linha por produto (codigo, descricao, NCM, CFOP, quantidade e valores). "
