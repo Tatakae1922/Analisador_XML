@@ -67,6 +67,18 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import tkinter as tk
 
+# Motor de retencoes em NFS-e (arquivo motor_retencoes.py, ao lado
+# deste). E ele que le NFS-e em PDF (layout antigo de prefeitura,
+# DANFSe nacional e PDF escaneado via OCR) e que sabe separar o que e
+# RETENCAO de verdade do que e tributo da propria operacao.
+# Se o pdfplumber nao estiver instalado, o programa continua
+# funcionando normalmente, so sem a parte de PDF/retencoes.
+try:
+    import motor_retencoes
+    MOTOR_RETENCOES_OK = True
+except ImportError:
+    MOTOR_RETENCOES_OK = False
+
 try:
     from PIL import Image
     PIL_OK = True
@@ -118,7 +130,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v01.9"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v02.0"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -537,6 +549,10 @@ def identificar_tipo_documento(root):
         return "nfse"
     if root.find(".//a:InfNfse", NS_ABRASF) is not None:
         return "nfse_abrasf"
+    # Cancelamento de NFS-e nao vem dentro da nota: e um arquivo
+    # <evento> separado, que aponta a chave da nota cancelada.
+    if root.find(".//nfse:chNFSe", NS_NFSE) is not None:
+        return "evento_cancelamento"
     return None
 
 
@@ -901,6 +917,17 @@ def processar_arquivo_xml(fonte, callback_log=print):
             return None, None, [], None, []
         return "nfse", dados, [], None, []
 
+    if tipo == "evento_cancelamento":
+        chave = extrair_texto(root, ".//nfse:chNFSe", NS_NFSE)
+        return "evento_cancelamento", {
+            "Chave da Nota Cancelada": chave,
+            "Motivo": extrair_texto(root, ".//nfse:xMotivo", NS_NFSE),
+            "Data do Cancelamento": extrair_data_emissao_formatada(
+                extrair_texto(root, ".//nfse:dhEvento", NS_NFSE)
+                or extrair_texto(root, ".//nfse:dhProc", NS_NFSE)),
+            "Arquivo de Origem": nome_arquivo,
+        }, [], None, []
+
     if tipo == "nfse_abrasf":
         dados = _processar_nfse_abrasf(root, nome_arquivo)
         if dados is None:
@@ -910,6 +937,59 @@ def processar_arquivo_xml(fonte, callback_log=print):
 
     callback_log(f"[AVISO] Arquivo '{nome_arquivo}' nao e um XML de NF-e, NFC-e, CT-e ou NFS-e reconhecido.")
     return None, None, [], None, []
+
+
+def _processar_pdf_nfse(caminho_pdf, callback_log=print):
+    """
+    Le uma NFS-e em PDF usando o motor de retencoes (ver
+    motor_retencoes.py) e devolve uma lista de dicts, um por nota --
+    um mesmo PDF pode trazer varias notas (relatorios e taloes).
+
+    PDF que nao e NFS-e (ex.: um DANFE de NF-e, um contrato) e
+    descartado em silencio: o motor devolve um registro sem numero e
+    sem valor, e nao faz sentido poluir a planilha com ele.
+    """
+    nome_arquivo = os.path.basename(caminho_pdf)
+    try:
+        notas = motor_retencoes.analisar_arquivo(_caminho_longo_windows(caminho_pdf))
+    except Exception as erro:  # PDF corrompido/protegido nao derruba o lote
+        callback_log(f"[AVISO] Nao foi possivel ler o PDF '{nome_arquivo}': {erro}")
+        return []
+
+    linhas = []
+    for nota in notas:
+        if nota.get("erro"):
+            callback_log(f"[AVISO] PDF '{nome_arquivo}': {nota['erro']}")
+            continue
+        if not nota.get("numero_nota") and not nota.get("_valor_total_float"):
+            continue  # nao era uma NFS-e
+
+        linhas.append({
+            "Arquivo de Origem": nome_arquivo,
+            "Pagina(s)": nota.get("paginas", ""),
+            "Layout": nota.get("layout", ""),
+            "Situacao": nota.get("situacao", "Normal"),
+            "Numero da Nota": nota.get("numero_nota", ""),
+            "Data de Emissao": nota.get("data_emissao", ""),
+            "CNPJ Prestador": nota.get("cnpj_prestador", ""),
+            "Nome Prestador": nota.get("prestador", ""),
+            "CNPJ Tomador": nota.get("cnpj_tomador", ""),
+            "Nome Tomador": nota.get("tomador", ""),
+            "Descricao do Servico": nota.get("discriminacao", ""),
+            "Valor Total da Nota": nota.get("_valor_total_float"),
+            "PIS Retido": nota.get("_pis_float"),
+            "COFINS Retido": nota.get("_cofins_float"),
+            "CSLL Retido": nota.get("_csll_float"),
+            "INSS Retido": nota.get("_inss_float"),
+            "IRRF Retido": nota.get("_irrf_float"),
+            "ISS Retido": nota.get("_iss_float"),
+            "Total Retido": nota.get("_total_retencoes_float"),
+            "Valor Liquido (pos retencao)": nota.get("_valor_liquido_float"),
+            "Tributos Retidos": nota.get("retencoes_encontradas", ""),
+            "Situacao do ISS": nota.get("obs_iss", ""),
+            "Avisos": nota.get("obs_geral", ""),
+        })
+    return linhas
 
 
 def listar_fontes_xml(pasta):
@@ -935,6 +1015,11 @@ def listar_fontes_xml(pasta):
             caminho_completo = os.path.join(pasta_atual, nome_arquivo)
             if nome_arquivo.lower().endswith(".xml"):
                 fontes_encontradas.append(caminho_completo)
+            elif nome_arquivo.lower().endswith(".pdf") and MOTOR_RETENCOES_OK:
+                # PDF so interessa como NFS-e (nota de servico). Quem
+                # decide se e mesmo uma NFS-e e o motor de retencoes,
+                # ao tentar ler o layout.
+                fontes_encontradas.append(("pdf", caminho_completo))
             elif nome_arquivo.lower().endswith(".zip"):
                 try:
                     with zipfile.ZipFile(caminho_completo) as arquivo_zip:
@@ -1043,12 +1128,26 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     linhas_parcelas = []
     linhas_condicoes_pagamento = []
     linhas_itens = []
+    linhas_nfse_pdf = []
+    cancelamentos = {}
     chaves_ja_lidas = set()
     quantidade_repetidos = 0
     for fonte in fontes_xml:
+        if isinstance(fonte, tuple) and fonte[0] == "pdf":
+            callback_log(f"Lendo (PDF): {os.path.basename(fonte[1])}")
+            linhas_nfse_pdf.extend(_processar_pdf_nfse(fonte[1], callback_log=callback_log))
+            continue
+
         nome_para_log = f"{fonte[2]} (dentro de {os.path.basename(fonte[1])})" if isinstance(fonte, tuple) else os.path.basename(fonte)
         callback_log(f"Lendo: {nome_para_log}")
         tipo, dados, parcelas_da_nota, condicao_pagamento, itens_da_nota = processar_arquivo_xml(fonte, callback_log=callback_log)
+
+        # Evento de cancelamento: nao e nota, e o aviso de que uma
+        # nota (identificada pela chave) foi cancelada. Guarda para
+        # cruzar com as notas depois que o lote inteiro for lido.
+        if tipo == "evento_cancelamento":
+            cancelamentos[dados["Chave da Nota Cancelada"]] = dados
+            continue
 
         # Mesmo documento lido de novo (outra copia do XML) -- ignora
         # inteiro (inclusive itens/parcelas), senao os valores somam em
@@ -1079,8 +1178,40 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         elif tipo == "nfse_abrasf":
             linhas_nfse_abrasf.append(dados)
 
-    if not (linhas_nfe or linhas_nfce or linhas_cte or linhas_nfse or linhas_nfse_abrasf):
-        mensagem = "Nenhum documento valido (NF-e, NFC-e, CT-e ou NFS-e) foi extraido dos XMLs encontrados. Nada foi salvo."
+    # ---- Cancelamentos -------------------------------------------------
+    # So da para marcar uma nota como cancelada DEPOIS de ler o lote
+    # inteiro, porque o cancelamento vem num arquivo separado da nota.
+    # A nota cancelada continua na planilha (com os valores que tinha),
+    # so que marcada -- se sumisse, ninguem perceberia que ela existe.
+    quantidade_canceladas = 0
+    if cancelamentos:
+        for linha in linhas_nfse:
+            chave = (linha.get("Chave/Id da NFS-e") or "")
+            chave = chave[3:] if chave.startswith("NFS") else chave
+            evento = cancelamentos.get(chave)
+            if evento is None:
+                continue
+            quantidade_canceladas += 1
+            linha["Situacao"] = "CANCELADA"
+            linha["Cancelamento"] = (f"Cancelada em {evento['Data do Cancelamento']}. "
+                                     f"Motivo: {evento['Motivo']}")
+        callback_log(f"{len(cancelamentos)} evento(s) de cancelamento encontrado(s); "
+                     f"{quantidade_canceladas} nota(s) marcada(s) como CANCELADA.")
+        if quantidade_canceladas < len(cancelamentos):
+            callback_log("[AVISO] Ha evento(s) de cancelamento cuja NFS-e nao esta na(s) "
+                         "pasta(s) analisada(s) -- essa(s) nota(s) pode(m) estar sendo "
+                         "contada(s) como valida(s) em outro relatorio.")
+
+    # Toda NFS-e Nacional recebe a coluna Situacao (as nao canceladas
+    # ficam "Normal"), senao a coluna so apareceria em alguns lotes.
+    for linha in linhas_nfse:
+        linha.setdefault("Situacao", "Normal")
+        linha.setdefault("Cancelamento", "")
+
+    if not (linhas_nfe or linhas_nfce or linhas_cte or linhas_nfse
+            or linhas_nfse_abrasf or linhas_nfse_pdf):
+        mensagem = ("Nenhum documento valido (NF-e, NFC-e, CT-e, NFS-e em XML ou NFS-e em PDF) "
+                    "foi extraido dos arquivos encontrados. Nada foi salvo.")
         callback_log(mensagem)
         return False, mensagem
 
@@ -1172,6 +1303,17 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
                        "PIS Retido", "COFINS Retido", "CSLL Retido", "IR Retido", "INSS Retido", "Valor Liquido"]:
             df_nfse_abrasf[coluna] = pd.to_numeric(df_nfse_abrasf[coluna], errors="coerce")
 
+    # ---- NFS-e lidas de PDF (via motor de retencoes) ---------------------
+    df_nfse_pdf = None
+    colunas_texto_nfse_pdf = ["Numero da Nota", "CNPJ Prestador", "CNPJ Tomador", "Pagina(s)"]
+    if linhas_nfse_pdf:
+        df_nfse_pdf = pd.DataFrame(linhas_nfse_pdf)
+        _forcar_colunas_como_texto(df_nfse_pdf, colunas_texto_nfse_pdf)
+        for coluna in ["Valor Total da Nota", "PIS Retido", "COFINS Retido", "CSLL Retido",
+                       "INSS Retido", "IRRF Retido", "ISS Retido", "Total Retido",
+                       "Valor Liquido (pos retencao)"]:
+            df_nfse_pdf[coluna] = pd.to_numeric(df_nfse_pdf[coluna], errors="coerce")
+
     extensao = os.path.splitext(arquivo_saida)[1].lower()
 
     # Cada aba que existir vira um arquivo -- a primeira da lista usa o
@@ -1182,6 +1324,7 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         ("CT-e", df_cte, colunas_texto_cte, "_cte"),
         ("NFS-e Nacional", df_nfse, colunas_texto_nfse, "_nfse"),
         ("NFS-e Municipal (ABRASF)", df_nfse_abrasf, colunas_texto_nfse_abrasf, "_nfse_municipal"),
+        ("NFS-e PDF (Retencoes)", df_nfse_pdf, colunas_texto_nfse_pdf, "_nfse_pdf"),
         ("Itens da Nota", df_itens, colunas_texto_itens, "_itens"),
         ("Fatura e Duplicatas", df_parcelas, colunas_texto_parcelas, "_fatura_duplicatas"),
         ("Condicoes de Pagamento (Texto)", df_condicoes, colunas_texto_condicoes, "_condicoes_pagamento"),
@@ -1217,6 +1360,9 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
     if linhas_nfse_abrasf:
         quantidade_paulistana = sum(1 for l in linhas_nfse_abrasf if l["Municipio"].startswith("SAO PAULO"))
         partes_resumo.append(f"{len(linhas_nfse_abrasf)} NFS-e Municipal ({quantidade_paulistana} Paulistana)")
+    if linhas_nfse_pdf:
+        com_retencao = sum(1 for l in linhas_nfse_pdf if l["Total Retido"])
+        partes_resumo.append(f"{len(linhas_nfse_pdf)} NFS-e em PDF ({com_retencao} com retencao)")
 
     quantidade_com_parcelas = sum(1 for l in linhas_nfe + linhas_nfce if l["Quantidade de Parcelas"] > 0)
     mensagem = (
@@ -1227,6 +1373,8 @@ def gerar_planilha(pastas_origem, arquivo_saida, callback_log=print):
         + (f" {len(linhas_condicoes_pagamento)} nota(s) com condicao de pagamento reconhecida no texto de observacoes." if linhas_condicoes_pagamento else "")
         + (f" {quantidade_repetidos} arquivo(s) repetido(s) (mesmo documento em mais de um XML/.zip) foram ignorados "
            f"para nao contar em dobro." if quantidade_repetidos else "")
+        + (f" ATENCAO: {quantidade_canceladas} nota(s) CANCELADA(S) -- estao marcadas na coluna "
+           f"'Situacao' da aba NFS-e Nacional." if quantidade_canceladas else "")
         + f"\nArquivo salvo em: {os.path.abspath(arquivo_saida)}"
     )
     callback_log(mensagem)
@@ -1387,7 +1535,7 @@ class App(ctk.CTk):
                      text_color=COR_TEXTO).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(card, text="Pode adicionar mais de uma pasta -- os documentos de todas elas entram no "
                                  "mesmo resultado. Cada pasta pode conter subpastas -- o programa varre tudo "
-                                 "recursivamente, inclusive XMLs que estiverem dentro de arquivos .zip.",
+                                 "recursivamente, inclusive XMLs dentro de arquivos .zip e NFS-e em PDF.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
@@ -1451,8 +1599,10 @@ class App(ctk.CTk):
                                  "com uma linha por produto (codigo, descricao, NCM, CFOP, quantidade e valores). "
                                  "Do CT-e extrai dados do transporte (transportadora, remetente, "
                                  "destinatario, valores, vencimento). Das NFS-e extrai prestador, tomador, municipio, "
-                                 "descricao do servico, valores/ISS e retencoes federais -- inclusive documentos que "
-                                 "estiverem dentro de arquivos .zip.",
+                                 "descricao do servico, valores/ISS e retencoes federais. Le NFS-e tambem em PDF "
+                                 "(layout antigo de prefeitura, DANFSe nacional e PDF escaneado via OCR), separando "
+                                 "o que e retencao de verdade do que e tributo da propria operacao, e marca as notas "
+                                 "CANCELADAS quando o evento de cancelamento estiver na pasta.",
                      font=ctk.CTkFont(FONTE, 13), text_color=COR_MUTED,
                      justify="left", wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
