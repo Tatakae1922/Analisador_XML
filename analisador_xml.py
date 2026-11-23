@@ -130,7 +130,7 @@ _PALETA_CLARA = {
 
 FONTE = "Calibri"
 NOME_ESCRITORIO = "HEC ASSESSORIA CONTABIL S/S LTDA."
-VERSAO_PROGRAMA = "v02.0"  # atualize a cada nova versao gerada
+VERSAO_PROGRAMA = "v02.1"  # atualize a cada nova versao gerada
 
 
 def _caminho_preferencia_tema():
@@ -958,6 +958,12 @@ def _processar_pdf_nfse(caminho_pdf, callback_log=print):
 
     linhas = []
     for nota in notas:
+        # PDF que nao e nota de servico (DANFE de NF-e, extrato de
+        # DUIMP, contrato...) e descartado SEM AVISO: as pastas dos
+        # clientes estao cheias deles, e avisar um por um so encheria
+        # o log de ruido sobre arquivos que nunca deveriam entrar aqui.
+        if nota.get("nao_e_nfse"):
+            continue
         if nota.get("erro"):
             callback_log(f"[AVISO] PDF '{nome_arquivo}': {nota['erro']}")
             continue

@@ -208,7 +208,13 @@ def _pagina_texto_e_tabelas(pagina) -> tuple[str, bool]:
     imagem, tenta OCR como ultimo recurso."""
     texto_puro = pagina.extract_text(layout=False) or ""
     usou_ocr = False
-    if not texto_puro.strip() and pagina.images:
+    # Sem camada de texto, tenta OCR em qualquer pagina que tenha ALGO
+    # desenhado - nao so imagem. Ha scanners que guardam a digitalizacao
+    # de um jeito que o pdfplumber nao lista em .images, e exigir imagem
+    # fazia essas notas serem descartadas sem nem tentar. Pagina
+    # totalmente em branco continua sendo pulada (OCR e lento).
+    pagina_tem_conteudo = bool(pagina.images or pagina.curves or pagina.rects)
+    if not texto_puro.strip() and pagina_tem_conteudo:
         texto_puro = _ocr_pagina(pagina)
         usou_ocr = bool(texto_puro.strip())
     partes = [texto_puro]
@@ -706,8 +712,16 @@ _PAT_DISCRIMINACAO_DANFSE = re.compile(
 
 
 def _bloco_secao(texto: str, inicio_pat: str, fim_pat: str) -> str:
-    m = re.search(inicio_pat + r"(.*?)" + fim_pat, texto, re.IGNORECASE | re.DOTALL)
-    return m.group(1) if m else ""
+    """Devolve o trecho de texto ENTRE dois marcadores (ex.: tudo que
+    esta entre "TOMADOR / ADQUIRENTE" e "SERVICO PRESTADO").
+
+    O (?:...) em volta do fim_pat e obrigatorio: varios marcadores de
+    fim sao uma lista de alternativas ("A|B|C") e, sem o grupo, o "|"
+    separaria o PADRAO INTEIRO -- viraria "(inicio(.*?)A)" ou "B" ou
+    "C". Quando o casamento vinha por "B"/"C", o grupo 1 nao existia e
+    a funcao devolvia None, derrubando a leitura do PDF inteiro."""
+    m = re.search(inicio_pat + r"(.*?)(?:" + fim_pat + r")", texto, re.IGNORECASE | re.DOTALL)
+    return (m.group(1) or "") if m else ""
 
 
 def _analisar_danfse(texto: str, bloco: dict | None = None) -> dict:
@@ -895,6 +909,7 @@ def _calcular_totais(r: dict) -> None:
     r.setdefault("situacao", "Normal")
     r.setdefault("obs_cancelamento", "")
     r.setdefault("tipo_registro", "nota")
+    r.setdefault("nao_e_nfse", False)
 
 
 def _analisar_bloco(bloco: dict) -> dict:
@@ -1221,6 +1236,7 @@ def _analisar_pdf(caminho: Path) -> list[dict]:
         return [_resultado_vazio(caminho.name, str(e))]
 
     houve_pagina_sem_texto_e_sem_ocr = False
+    houve_texto_legivel = False
     resultados = []
     for bloco in blocos:
         texto = bloco["texto"]
@@ -1228,6 +1244,7 @@ def _analisar_pdf(caminho: Path) -> list[dict]:
             if not OCR_DISPONIVEL:
                 houve_pagina_sem_texto_e_sem_ocr = True
             continue
+        houve_texto_legivel = True
         r = _analisar_bloco(bloco)
         if r["layout"].startswith("Nao identificado") and not r["numero_nota"] and not r["_valor_total_float"]:
             continue  # pagina de capa/rosto sem dado nenhum de nota (ex.: capa do Talao Fiscal)
@@ -1241,9 +1258,24 @@ def _analisar_pdf(caminho: Path) -> list[dict]:
             erro = ("PDF escaneado (sem camada de texto) e o OCR (Tesseract) nao foi "
                      "encontrado nesta maquina. Instale o Tesseract OCR para processar "
                      "este arquivo, ou peca a NFS-e em formato com texto.")
+            vazio = _resultado_vazio(caminho.name, erro)
+        elif houve_texto_legivel:
+            # O PDF foi lido sem problema nenhum - so nao e uma NFS-e
+            # (ex.: DANFE de NF-e, extrato de DUIMP, contrato). Marcado
+            # para quem chama poder descartar em silencio, em vez de
+            # encher o log de "erro" por arquivo que nunca deveria ter
+            # sido analisado como nota de servico.
+            vazio = _resultado_vazio(
+                caminho.name,
+                "Nao e uma NFS-e: o PDF foi lido normalmente, mas nenhuma nota fiscal "
+                "de servico foi reconhecida nele.")
+            vazio["nao_e_nfse"] = True
         else:
-            erro = "Sem texto extraivel (PDF vazio ou corrompido?)"
-        resultados.append(_resultado_vazio(caminho.name, erro))
+            erro = ("Nao foi possivel extrair texto deste PDF (sem camada de texto e o OCR "
+                     "tambem nao devolveu nada). Pode ser um PDF com o texto vetorizado, em "
+                     "branco ou corrompido - conferir o arquivo manualmente.")
+            vazio = _resultado_vazio(caminho.name, erro)
+        resultados.append(vazio)
     return resultados
 
 
